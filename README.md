@@ -44,7 +44,15 @@ python -m hitmo.server
 
 Por padrão, o serviço escuta somente em `127.0.0.1:8765`. Para adicionar uma conta de edição, use `python -m hitmo.server --add-user NOME --role editor`. O uso pela LAN exige certificado e chave TLS: `python -m hitmo.server --host 0.0.0.0 --port 8765 --cert C:\caminho\servidor.crt --key C:\caminho\servidor.key`. Configure o firewall do Windows para permitir a porta apenas na rede privada da emissora. O serviço não publica nem abre portas na internet.
 
-Clientes remotos acessam a API autenticada e não recebem acesso ao arquivo SQLite. Os caminhos de mídia enviados à API precisam ser acessíveis pelo computador da rádio. A API não oferece comandos de reprodução. Consulte [docs/service-api.md](docs/service-api.md) para endpoints e uso do cliente Python.
+Clientes remotos acessam a API autenticada e não recebem acesso ao arquivo SQLite. Caminhos indisponíveis no servidor podem ser preservados e são sinalizados; não tornam a mídia executável. A API não oferece comandos de reprodução. Consulte [docs/service-api.md](docs/service-api.md) para o serviço e [docs/config-manager.md](docs/config-manager.md) para o aplicativo independente.
+
+Inicie o ConfigManager sozinho em qualquer estação com Python 3.12 e as dependências instaladas:
+
+```powershell
+python -m hitmo.config_manager_app
+```
+
+Ou execute `run_config_manager.bat`. O aplicativo conecta-se ao serviço central por HTTP no computador local ou HTTPS/TLS na rede. Categorias e pastas são consultadas; a edição remota delas não está disponível nesta versão.
 
 ## Executar o protótipo original
 
@@ -73,5 +81,9 @@ Os testes cobrem banco SQLite, importação e classificação de mídia, playlis
 - `hitmo/audio_engine.py`: players do programa, pré-escuta e trilhas em loop.
 - `hitmo/database.py` e `hitmo/services.py`: persistência SQLite e serviços de mídia, playlist, timeline e histórico.
 - `hitmo/main_window.py`, `hitmo/config_manager.py` e `hitmo/operator_dialog.py`: interface e configuração.
+- `hitmo/config_manager_app.py`: aplicativo desktop ConfigManager independente, conectado pela API central.
+- `hitmo/api_client.py`, `hitmo/api_service.py` e `hitmo/server.py`: cliente, API e processo central.
+- `hitmo/shortcuts.py`: cartões referenciais locais `.hitmo.json`, indexados pelo `media.id`.
 - `tests/`: testes automatizados.
 - `docs/reference-analysis.md`: análise funcional das referências.
+- `docs/config-manager.md`: operação e limites do aplicativo independente.

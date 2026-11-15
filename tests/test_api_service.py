@@ -122,6 +122,55 @@ class CentralAPIProcessTests(unittest.TestCase):
         self.assertIn(material_id, [row["id"] for row in self.admin.materials()["materials"]])
         self.assertGreater(restored["revision"], updated["revision"])
 
+    def test_missing_path_is_preserved_and_text_is_not_converted_to_audio(self):
+        missing = self.root / "unplugged-share" / "identificador.mp3"
+        revision = self.admin.version()["catalog_revision"]
+        created = self.admin.add_material({"path": str(missing), "title": "Fora do ar", "category": "Música"}, revision)
+        record = next(row for row in self.admin.materials()["materials"] if row["id"] == created["id"])
+        self.assertFalse(record["path_exists_on_server"])
+        self.assertEqual(record["path"], str(missing.resolve()))
+        previous_id = record["id"]
+        moved = self.root / "novo-diretorio" / "mesmo-material.mp3"
+        updated = self.admin.update_material(previous_id, {"path": str(moved), "title": "Fora do ar", "category": "Música"}, self.admin.version()["catalog_revision"])
+        self.assertEqual(updated["id"], previous_id)
+
+        text_record = self.admin.add_material(
+            {"path": "hitmo://text/ref-texto-1", "title": "Texto de locução", "category": "Texto", "text_content": "Texto preservado."},
+            self.admin.version()["catalog_revision"],
+        )
+        row = self.db.one("SELECT id,path,text_content FROM media WHERE id=?", (text_record["id"],))
+        self.assertEqual((row["path"], row["text_content"]), ("hitmo://text/ref-texto-1", "Texto preservado."))
+        view = next(item for item in self.admin.materials()["materials"] if item["id"] == text_record["id"])
+        self.assertEqual(view["material_kind"], "text")
+        self.assertFalse(view["path_exists_on_server"])
+
+    def test_material_can_be_assigned_to_existing_server_folder(self):
+        category_id = int(self.db.one("SELECT id FROM material_categories WHERE name='Música'")["id"])
+        folder_id = self.db.execute(
+            "INSERT INTO media_folders(name,path,category_id) VALUES(?,?,?)",
+            ("Biblioteca", str(self.root / "music"), category_id),
+        )
+        result = self.admin.add_material(
+            {"path": str(self.root / "offline.wav"), "title": "Sem arquivo presente", "category": "Música", "folder_id": folder_id},
+            self.admin.version()["catalog_revision"],
+        )
+        record = next(row for row in self.admin.materials()["materials"] if row["id"] == result["id"])
+        self.assertEqual(record["folder_id"], folder_id)
+        self.assertFalse(record["path_exists_on_server"])
+
+    def test_path_collision_does_not_create_a_second_catalog_id(self):
+        audio = self._write_audio("CaseSensitive.wav")
+        self.admin.add_material(
+            {"path": str(audio), "title": "Único", "category": "Música"},
+            self.admin.version()["catalog_revision"],
+        )
+        with self.assertRaisesRegex(RuntimeError, "409"):
+            self.admin.add_material(
+                {"path": str(audio).swapcase(), "title": "Duplicado", "category": "Música"},
+                self.admin.version()["catalog_revision"],
+            )
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM media WHERE title IN ('Único','Duplicado')")["n"], 1)
+
     def test_two_clients_using_same_catalog_revision_get_conflict(self):
         revision = self.admin.version()["catalog_revision"]
         payloads = [self._material("first.wav"), self._material("second.wav")]
@@ -200,6 +249,22 @@ class CentralAPIProcessTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "409"):
             self.admin.publish_draft(draft["id"], draft["draft_revision"])
         self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM program_blocks")["n"], 0)
+
+    def test_playlist_reference_snapshot_is_read_only_and_preserves_legacy_codes(self):
+        catalog_id = self.db.execute(
+            "INSERT INTO playlist_catalogs(source_path,version,declared_folder_count) VALUES(?,?,?)",
+            ("C:/Playlist/pgm/Folders.xml", "Playlist Digital", 1),
+        )
+        self.db.execute(
+            "INSERT INTO playlist_folder_entries(catalog_id,position,playlist_id,title,type_code,target,shortcut_arguments,shortcut_path_name,dbf_id) VALUES(?,?,?,?,?,?,?,?,?)",
+            (catalog_id, 0, 902, "Músicas", "MUS", "M:\\Audio", "-m", "Músicas.lnk", "DBF-902"),
+        )
+        references = self.admin.playlist_references()
+        entry = references["entries"][0]
+        self.assertEqual(entry["playlist_id"], 902)
+        self.assertEqual(entry["type_code"], "MUS")
+        self.assertEqual(entry["dbf_id"], "DBF-902")
+        self.assertEqual(references["catalog"]["source_path"], "C:/Playlist/pgm/Folders.xml")
 
     def test_http_is_refused_on_lan_without_tls_and_no_audio_route_exists(self):
         with self.assertRaisesRegex(ValueError, "TLS"):

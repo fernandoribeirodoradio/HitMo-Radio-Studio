@@ -179,8 +179,18 @@ class MediaLibrary:
     def search(self, text: str = "", category: str = "Todos"):
         term = f"%{text.strip()}%"
         if category == "Todos":
-            return self.db.all("SELECT * FROM media WHERE active=1 AND (title LIKE ? OR artist LIKE ? OR path LIKE ?) ORDER BY title COLLATE NOCASE", (term, term, term))
-        return self.db.all("SELECT * FROM media WHERE active=1 AND category=? AND (title LIKE ? OR artist LIKE ? OR path LIKE ?) ORDER BY title COLLATE NOCASE", (category, term, term, term))
+            return self.db.all(
+                "SELECT m.* FROM media m LEFT JOIN material_categories c ON c.name=m.category "
+                "WHERE m.active=1 AND COALESCE(c.material_kind,'audio')='audio' "
+                "AND (m.title LIKE ? OR m.artist LIKE ? OR m.path LIKE ?) ORDER BY m.title COLLATE NOCASE",
+                (term, term, term),
+            )
+        return self.db.all(
+            "SELECT m.* FROM media m LEFT JOIN material_categories c ON c.name=m.category "
+            "WHERE m.active=1 AND COALESCE(c.material_kind,'audio')='audio' AND m.category=? "
+            "AND (m.title LIKE ? OR m.artist LIKE ? OR m.path LIKE ?) ORDER BY m.title COLLATE NOCASE",
+            (category, term, term, term),
+        )
 
 
 class PlaylistService:

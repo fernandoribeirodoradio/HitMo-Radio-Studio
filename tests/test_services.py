@@ -36,6 +36,11 @@ class ServiceTests(unittest.TestCase):
         rows = self.db.all("SELECT name,role FROM operators WHERE active=1")
         self.assertEqual([(r["name"], r["role"]) for r in rows], [("Operador padrão", "Administrador")])
 
+    def test_audio_library_hides_catalog_text_materials(self):
+        self.db.execute("INSERT INTO media(path,title,category) VALUES(?,?,?)", ("hitmo://material/audio-1", "Audio", "Música"))
+        self.db.execute("INSERT INTO media(path,title,category,text_content) VALUES(?,?,?,?)", ("hitmo://text/text-1", "Texto", "Texto", "Ler no ar"))
+        self.assertEqual([row["title"] for row in self.library.search()], ["Audio"])
+
     def test_import_scans_folder_and_skips_duplicates(self):
         folder = self.root / "Comerciais"
         first = make_wav(folder / "Marca - Oferta.mp3")

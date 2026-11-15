@@ -132,6 +132,7 @@ class PlaylistCompatibilityTests(unittest.TestCase):
         self.assertEqual(migrated.one("SELECT title FROM media WHERE id=1")["title"], "Canção antiga")
         self.assertEqual(migrated.one("SELECT operator FROM playback_history WHERE id=1")["operator"], "Operador antigo")
         self.assertIn("folder_id", {row["name"] for row in migrated.all("PRAGMA table_info(media)")})
+        self.assertIn("text_content", {row["name"] for row in migrated.all("PRAGMA table_info(media)")})
         self.assertIn("status", {row["name"] for row in migrated.all("PRAGMA table_info(playlist_items)")})
         self.assertIn("duration", {row["name"] for row in migrated.all("PRAGMA table_info(program_occurrence_items)")})
         self.assertEqual(migrated.one("SELECT COUNT(*) AS n FROM playlist_folder_entries")["n"], 0)

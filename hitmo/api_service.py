@@ -85,6 +85,16 @@ def _jsonable(row) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
 
 
+def _material_json(row) -> dict[str, Any]:
+    result = _jsonable(row)
+    path = str(result.get("path") or "")
+    try:
+        result["path_exists_on_server"] = bool(path and not path.startswith("hitmo://") and Path(path).is_file())
+    except OSError:
+        result["path_exists_on_server"] = False
+    return result
+
+
 def _parse_days(value: Any) -> list[int]:
     if not isinstance(value, list) or not value:
         raise APIError(422, "days deve ser uma lista não vazia de dias 0–6.")
@@ -245,6 +255,7 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
                     "catalog_revision": int(self.server.db.one("SELECT revision FROM catalog_state WHERE id=1")["revision"]),
                     "program_revision": int(self.server.db.one("SELECT revision FROM program_state WHERE id=1")["revision"]),
                     "authenticated_as": user["username"],
+                    "role": user["role"],
                 })
                 return
             if path == "/api/v1/categories":
@@ -262,15 +273,32 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
                 sql += " ORDER BY f.name COLLATE NOCASE"
                 self._send(200, {"folders": [_jsonable(row) for row in self.server.db.all(sql)]})
                 return
+            if path == "/api/v1/playlist-references":
+                self._authenticate("catalog.read")
+                catalog = self.server.db.one("SELECT id,source_path,version,imported_at FROM playlist_catalogs ORDER BY imported_at DESC,id DESC LIMIT 1")
+                if not catalog:
+                    self._send(200, {"catalog": None, "entries": []})
+                    return
+                entries = self.server.db.all(
+                    "SELECT playlist_id,title,type_code,target,icon_location,shortcut_arguments,shortcut_path_name,icon_index,output,total_files,dbf_id,target_exists,position "
+                    "FROM playlist_folder_entries WHERE catalog_id=? ORDER BY position,playlist_id",
+                    (int(catalog["id"]),),
+                )
+                self._send(200, {"catalog": _jsonable(catalog), "entries": [_jsonable(row) for row in entries]})
+                return
             if path == "/api/v1/materials":
                 self._authenticate("catalog.read")
                 include_inactive = query.get("include_inactive", ["0"])[0] == "1"
+                sql = (
+                    "SELECT m.*,COALESCE(c.material_kind,'audio') AS material_kind "
+                    "FROM media m LEFT JOIN material_categories c ON c.name=m.category"
+                )
                 if include_inactive:
                     # Inactive records are still visible to read-capable users; no deletion occurs.
-                    rows = self.server.db.all("SELECT * FROM media ORDER BY title COLLATE NOCASE")
+                    rows = self.server.db.all(sql + " ORDER BY m.title COLLATE NOCASE")
                 else:
-                    rows = self.server.db.all("SELECT * FROM media WHERE active=1 ORDER BY title COLLATE NOCASE")
-                self._send(200, {"materials": [_jsonable(row) for row in rows]})
+                    rows = self.server.db.all(sql + " WHERE m.active=1 ORDER BY m.title COLLATE NOCASE")
+                self._send(200, {"materials": [_material_json(row) for row in rows]})
                 return
             if path == "/api/v1/programs":
                 self._authenticate("program.read")
@@ -349,10 +377,13 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
                 with self.server.db.connect() as con:
                     con.execute("BEGIN IMMEDIATE")
                     self._expected_revision(con, "catalog_state")
+                    existing = con.execute("SELECT id FROM media WHERE path=? COLLATE NOCASE", (media["path"],)).fetchone()
+                    if existing:
+                        raise APIError(409, "Esse caminho já está cadastrado; edite o material existente.", {"id": int(existing["id"])})
                     try:
                         cur = con.execute(
-                            "INSERT INTO media(path,title,artist,category,duration,modified,description,icon_path,active) VALUES(?,?,?,?,?,?,?,?,1)",
-                            (media["path"], media["title"], media["artist"], media["category"], media["duration"], media["modified"], media["description"], media["icon_path"]),
+                            "INSERT INTO media(path,title,artist,category,duration,modified,description,icon_path,text_content,folder_id,active) VALUES(?,?,?,?,?,?,?,?,?,?,1)",
+                            (media["path"], media["title"], media["artist"], media["category"], media["duration"], media["modified"], media["description"], media["icon_path"], media["text_content"], media["folder_id"]),
                         )
                     except Exception as exc:
                         if "UNIQUE constraint failed" in str(exc):
@@ -428,15 +459,18 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
                 old = self.server.db.one("SELECT * FROM media WHERE id=?", (media_id,))
                 if not old:
                     raise APIError(404, "Material não encontrado.")
-                merged = {key: body.get(key, old[key]) for key in ("path", "title", "artist", "category", "duration", "description", "icon_path")}
+                merged = {key: body.get(key, old[key]) for key in ("path", "title", "artist", "category", "duration", "description", "icon_path", "text_content", "folder_id")}
                 media = self._validate_material(merged)
                 with self.server.db.connect() as con:
                     con.execute("BEGIN IMMEDIATE")
                     self._expected_revision(con, "catalog_state")
+                    duplicate = con.execute("SELECT id FROM media WHERE path=? COLLATE NOCASE AND id<>?", (media["path"], media_id)).fetchone()
+                    if duplicate:
+                        raise APIError(409, "Esse caminho já pertence a outro cadastro.", {"id": int(duplicate["id"])})
                     try:
                         cur = con.execute(
-                            "UPDATE media SET path=?,title=?,artist=?,category=?,duration=?,modified=?,description=?,icon_path=?,revision=revision+1 WHERE id=?",
-                            (media["path"], media["title"], media["artist"], media["category"], media["duration"], media["modified"], media["description"], media["icon_path"], media_id),
+                            "UPDATE media SET path=?,title=?,artist=?,category=?,duration=?,modified=?,description=?,icon_path=?,text_content=?,folder_id=?,revision=revision+1 WHERE id=?",
+                            (media["path"], media["title"], media["artist"], media["category"], media["duration"], media["modified"], media["description"], media["icon_path"], media["text_content"], media["folder_id"], media_id),
                         )
                     except Exception as exc:
                         if "UNIQUE constraint failed" in str(exc):
@@ -483,32 +517,71 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
         title = str(body.get("title", "")).strip()
         artist = str(body.get("artist", "")).strip()
         category = str(body.get("category", "")).strip()
-        if not isinstance(path, str) or not path.strip() or len(path) > 4096:
-            raise APIError(422, "path é obrigatório (máximo 4096 caracteres).")
+        if path is None:
+            path = ""
+        if not isinstance(path, str) or len(path) > 4096:
+            raise APIError(422, "path deve ser um caminho (máximo 4096 caracteres).")
         if not title or len(title) > 500:
             raise APIError(422, "title é obrigatório (máximo 500 caracteres).")
         if not category or len(category) > 200:
             raise APIError(422, "category é obrigatória (máximo 200 caracteres).")
-        resolved = str(Path(path).expanduser().resolve())
-        if not Path(resolved).is_file():
-            raise APIError(422, "O serviço central não consegue acessar o arquivo original informado.")
         category_row = self.server.db.one("SELECT material_kind FROM material_categories WHERE name=? AND active=1", (category,))
         if not category_row:
             raise APIError(422, "Categoria ativa não encontrada.")
-        if category_row["material_kind"] != "audio":
-            raise APIError(422, "Esta API cadastra materiais de áudio; textos e comandos não são executáveis pelo motor.")
+        material_kind = category_row["material_kind"]
+        folder_id = body.get("folder_id")
+        if folder_id in (None, ""):
+            folder_id = None
+        else:
+            try:
+                folder_id = int(folder_id)
+            except (TypeError, ValueError) as exc:
+                raise APIError(422, "folder_id deve ser o ID de uma pasta cadastrada.") from exc
+            folder = self.server.db.one(
+                "SELECT f.active,c.name AS category FROM media_folders f LEFT JOIN material_categories c ON c.id=f.category_id WHERE f.id=?",
+                (folder_id,),
+            )
+            if not folder or not folder["active"]:
+                raise APIError(422, "A pasta selecionada não existe ou está inativa.")
+            if folder["category"] and folder["category"] != category:
+                raise APIError(422, "A categoria do material não corresponde à categoria da pasta.")
+        text_content = str(body.get("text_content", ""))
+        if len(text_content.encode("utf-8")) > 512_000:
+            raise APIError(422, "text_content excede o limite de 512 KiB.")
+        if material_kind == "audio" and text_content:
+            raise APIError(422, "text_content só pode ser usado em uma categoria não sonora.")
+        path = path.strip()
+        if path.startswith("hitmo://"):
+            if material_kind == "audio" or not re.fullmatch(r"hitmo://(?:text|material)/[A-Za-z0-9_.-]{1,120}", path):
+                raise APIError(422, "Referência lógica inválida para este tipo de material.")
+            resolved = path
+            modified = 0.0
+        elif path:
+            resolved = str(Path(path).expanduser().resolve())
+            try:
+                modified = Path(resolved).stat().st_mtime
+            except OSError:
+                # Keep the catalog record and ID when a local or shared path is offline.
+                modified = 0.0
+        elif material_kind == "audio":
+            raise APIError(422, "Materiais de áudio precisam de um caminho físico.")
+        else:
+            token = secrets.token_hex(12)
+            resolved = f"hitmo://{'text' if material_kind == 'text' else 'material'}/{token}"
+            modified = 0.0
         try:
             duration = max(0.0, float(body.get("duration", 0) or 0))
         except (TypeError, ValueError) as exc:
             raise APIError(422, "duration deve ser numérica.") from exc
         if duration > 86_400:
             raise APIError(422, "duration excede 24 horas.")
-        stat = Path(resolved).stat()
         return {
             "path": resolved, "title": title, "artist": artist[:500], "category": category,
-            "duration": duration, "modified": stat.st_mtime,
+            "duration": duration, "modified": modified,
             "description": str(body.get("description", ""))[:4000],
             "icon_path": str(body.get("icon_path", ""))[:4096],
+            "text_content": text_content,
+            "folder_id": folder_id,
         }
 
     @staticmethod

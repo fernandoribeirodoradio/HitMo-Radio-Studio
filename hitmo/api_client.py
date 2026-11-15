@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import ssl
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -9,11 +10,17 @@ from urllib.request import Request, urlopen
 class HitMoAPIClient:
     """Small standard-library client for the separately hosted central API."""
 
-    def __init__(self, base_url: str, username: str, password: str, timeout: float = 3.0):
+    def __init__(self, base_url: str, username: str, password: str, timeout: float = 3.0, ca_file: str | None = None):
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.password = password
         self.timeout = max(0.25, min(float(timeout), 30.0))
+        self.ssl_context = ssl.create_default_context(cafile=ca_file) if self.base_url.lower().startswith("https://") else None
+
+    def _open(self, request):
+        if self.ssl_context is not None:
+            return urlopen(request, timeout=self.timeout, context=self.ssl_context)
+        return urlopen(request, timeout=self.timeout)
 
     def request(self, method: str, path: str, *, body: dict | None = None, revision: int | None = None):
         raw = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -25,7 +32,7 @@ class HitMoAPIClient:
             headers["If-Match"] = str(int(revision))
         req = Request(f"{self.base_url}{path}", data=raw, headers=headers, method=method.upper())
         try:
-            with urlopen(req, timeout=self.timeout) as response:
+            with self._open(req) as response:
                 payload = response.read(1_048_577)
                 if len(payload) > 1_048_576:
                     raise RuntimeError("Resposta da API excede 1 MiB.")
@@ -43,7 +50,7 @@ class HitMoAPIClient:
         # Health endpoint is intentionally unauthenticated for availability checks.
         req = Request(f"{self.base_url}/healthz", headers={"Accept": "application/json"})
         try:
-            with urlopen(req, timeout=self.timeout) as response:
+            with self._open(req) as response:
                 return json.loads(response.read(4096).decode("utf-8"))
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
             raise ConnectionError(f"Serviço central HitMo indisponível: {exc}") from exc
@@ -58,6 +65,9 @@ class HitMoAPIClient:
     def folders(self, include_inactive: bool = False):
         flag = "1" if include_inactive else "0"
         return self.request("GET", f"/api/v1/folders?include_inactive={flag}")
+
+    def playlist_references(self):
+        return self.request("GET", "/api/v1/playlist-references")
 
     def materials(self, include_inactive: bool = False):
         flag = "1" if include_inactive else "0"

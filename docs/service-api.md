@@ -52,6 +52,7 @@ Todas as rotas abaixo, exceto `/healthz`, exigem HTTP Basic Auth sobre loopback 
 | `GET /api/v1/version` | Leitura | Versão, revisão do catálogo e da programação |
 | `GET /api/v1/categories` | Leitura | Categorias; `?include_inactive=1` inclui inativas |
 | `GET /api/v1/folders` | Leitura | Pastas cadastradas |
+| `GET /api/v1/playlist-references` | Leitura | Snapshot mais recente de Folders.xml, sem associação automática ao catálogo |
 | `GET /api/v1/materials` | Leitura | Materiais ativos; `?include_inactive=1` inclui desativados |
 | `POST /api/v1/materials` | Edição | Cadastrar material; exige revisão do catálogo |
 | `PUT /api/v1/materials/{id}` | Edição | Atualizar metadados; exige revisão do catálogo |
@@ -65,6 +66,10 @@ Todas as rotas abaixo, exceto `/healthz`, exigem HTTP Basic Auth sobre loopback 
 | `GET /api/v1/clients` | Admin | Clientes autenticados recentemente ativos |
 
 Publicar uma programação altera os blocos salvos para execuções futuras. Ocorrências já geradas, seus itens congelados e o histórico não são removidos ou reescritos. Materiais são desativados logicamente, nunca apagados da unidade de armazenamento. A revisão de catálogo e a revisão de programação são separadas.
+
+O serviço retorna os campos do registro, `material_kind` derivado da categoria e `path_exists_on_server`. Escritas aceitam `folder_id` para uma pasta ativa existente, `text_content` para categorias de tipo texto, e `icon_path` como metadado de imagem. Um caminho indisponível pode ser preservado no cadastro sem trocar o ID. Para itens não sonoros sem arquivo, são aceitas referências lógicas `hitmo://text/...` ou `hitmo://material/...`; elas não são caminhos físicos nem são executáveis pelo agendador de áudio.
+
+`GET /api/v1/playlist-references` fornece somente a importação mais recente de `Folders.xml`. Seus IDs e códigos permanecem referências do Playlist, sem associação automática aos IDs de mídia do HitMo.
 
 ## Exemplo com o cliente Python
 
@@ -99,4 +104,4 @@ Execute a suíte com Python 3.12:
 python -m unittest discover -s tests -v
 ```
 
-Os testes do serviço usam banco temporário e dois processos locais quando necessário. Eles validam API entre processos no mesmo computador, mas não comprovam conectividade entre duas máquinas, políticas de firewall, certificado implantado, nem operação de áudio em hardware real.
+Os testes do serviço usam banco temporário e processos locais. Eles validam API entre processos no mesmo computador, mas não comprovam conectividade entre duas máquinas, políticas de firewall, certificado implantado, nem operação de áudio em hardware real. Para o ConfigManager independente, veja [config-manager.md](config-manager.md).

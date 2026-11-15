@@ -220,6 +220,7 @@ class Database:
                 "folder_id": "INTEGER",
                 "icon_path": "TEXT NOT NULL DEFAULT ''",
                 "description": "TEXT NOT NULL DEFAULT ''",
+                "text_content": "TEXT NOT NULL DEFAULT ''",
                 "active": "INTEGER NOT NULL DEFAULT 1",
                 "deactivated_at": "TEXT NOT NULL DEFAULT ''",
                 "revision": "INTEGER NOT NULL DEFAULT 1",

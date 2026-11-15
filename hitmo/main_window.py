@@ -162,6 +162,11 @@ class MainWindow(QMainWindow):
         self._refresh_library()
         self._apply_theme()
         self._restore_window()
+        revision_row = self.db.one("SELECT revision FROM catalog_state WHERE id=1")
+        self._observed_catalog_revision = int(revision_row["revision"]) if revision_row else 0
+        self._catalog_poll = QTimer(self)
+        self._catalog_poll.timeout.connect(self._poll_catalog_revision)
+        self._catalog_poll.start(1500)
         self._api_process = QProcess(self)
         self._api_process.finished.connect(self._api_process_finished)
         self._api_process.errorOccurred.connect(self._api_process_error)
@@ -653,6 +658,18 @@ class MainWindow(QMainWindow):
         index = self.category_filter.findText(current)
         self.category_filter.setCurrentIndex(max(0, index))
         self.category_filter.blockSignals(False)
+
+    def _poll_catalog_revision(self):
+        row = self.db.one("SELECT revision FROM catalog_state WHERE id=1")
+        if not row:
+            return
+        revision = int(row["revision"])
+        if revision == self._observed_catalog_revision:
+            return
+        self._observed_catalog_revision = revision
+        self._refresh_category_filter()
+        self._refresh_library()
+        self.statusBar().showMessage("Catálogo atualizado por outra estação; a execução atual foi mantida.", 5000)
 
     def _refresh_program_blocks(self):
         if not hasattr(self, "program_table"):
@@ -1192,6 +1209,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Histórico exportado: {path}", 7000)
 
     def closeEvent(self, event):
+        for timer_name in ("_timer", "_catalog_poll", "_api_poll"):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                timer.stop()
         if self._current:
             queue_id = self._current_queue_id
             self._end_current("interrupted", "Aplicativo encerrado durante a execução")
