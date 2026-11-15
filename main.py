@@ -81,7 +81,9 @@ class PlaylistTable(QTableWidget):
             row = self.rowCount()
             self.insertRow(row)
             self.setItem(row, 0, QTableWidgetItem(str(row + 1)))
-            self.setItem(row, 1, QTableWidgetItem(path.name))
+            name_item = QTableWidgetItem(path.name)
+            name_item.setData(Qt.ItemDataRole.UserRole, str(path))
+            self.setItem(row, 1, name_item)
             self.setItem(row, 2, QTableWidgetItem("—"))
             self.paths.append(path)
 
@@ -244,7 +246,9 @@ class RadioAutomation(QMainWindow):
             self.playlist.removeRow(row)
             self.playlist.insertRow(insert_at)
             self.playlist.setItem(insert_at, 0, QTableWidgetItem(str(insert_at + 1)))
-            self.playlist.setItem(insert_at, 1, QTableWidgetItem(path.name))
+            name_item = QTableWidgetItem(path.name)
+            name_item.setData(Qt.ItemDataRole.UserRole, str(path))
+            self.playlist.setItem(insert_at, 1, name_item)
             self.playlist.setItem(insert_at, 2, QTableWidgetItem("—"))
             self.playlist.refresh_numbers()
 
