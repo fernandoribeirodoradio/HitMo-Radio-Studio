@@ -72,6 +72,13 @@ class AudioEngine(QObject):
         elif self.program.source().isValid():
             self.program.play()
 
+    def pause_program(self) -> None:
+        self.program.pause()
+
+    def resume_program(self) -> None:
+        if self.program.source().isValid():
+            self.program.play()
+
     def stop_program(self) -> None:
         self.program.stop()
 

@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 from hitmo.database import Database
-from hitmo.services import MediaLibrary, PlaylistService, TimelineService, media_category
+from hitmo.services import MediaLibrary, PlaylistService, ProgrammingService, TimelineService, media_category
 
 
 def make_wav(path: Path, seconds: float = 0.15) -> Path:
@@ -27,6 +27,7 @@ class ServiceTests(unittest.TestCase):
         self.library = MediaLibrary(self.db)
         self.playlist = PlaylistService(self.db)
         self.timeline = TimelineService(self.db)
+        self.programming = ProgrammingService(self.db)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -58,6 +59,42 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual([int(r["item_id"]) for r in self.playlist.items()], new_order)
         self.assertEqual(int(self.playlist.pop_next()["item_id"]), new_order[0])
         self.assertEqual(len(self.playlist.items()), 2)
+        retained = self.db.one("SELECT status FROM playlist_items WHERE id=?", (new_order[0],))
+        self.assertEqual(retained["status"], "loading")
+
+    def test_program_block_creates_durable_ordered_occurrence(self):
+        files = [make_wav(self.root / f"track-{index}.wav") for index in range(2)]
+        self.library.import_paths(files, category="Música")
+        media_ids = [int(row["id"]) for row in self.db.all("SELECT id FROM media ORDER BY id")]
+        block_id = self.programming.add_block("Manhã", "Música", "12:30", [6])
+        source_items = [self.programming.add_block_item(block_id, media_id) for media_id in media_ids]
+        now = datetime(2026, 11, 15, 12, 30)
+        occurrence_ids = self.programming.due(now)
+        self.assertEqual(len(occurrence_ids), 1)
+        self.assertEqual(self.programming.due(now), [])
+        rows = self.db.all("SELECT * FROM program_occurrence_items WHERE occurrence_id=? ORDER BY position", (occurrence_ids[0],))
+        self.assertEqual([int(row["source_item_id"]) for row in rows], source_items)
+        self.programming.set_occurrence_item_status(int(rows[0]["id"]), "playing")
+        self.programming.set_occurrence_item_status(int(rows[0]["id"]), "completed")
+        self.assertEqual(int(self.programming.next_occurrence_item()["id"]), int(rows[1]["id"]))
+        self.programming.remove_block_item(source_items[0])
+        self.programming.remove_block(block_id)
+        retained = self.db.all("SELECT title,path,status FROM program_occurrence_items WHERE occurrence_id=? ORDER BY position", (occurrence_ids[0],))
+        self.assertEqual(len(retained), 2)
+        self.assertTrue(all(Path(row["path"]).is_file() for row in retained))
+
+    def test_configured_material_folder_and_category_do_not_delete_files(self):
+        folder = self.root / "Spots"
+        media_file = make_wav(folder / "spot.wav")
+        category_id = int(self.db.one("SELECT id FROM material_categories WHERE name='Comercial'")["id"])
+        folder_id = self.library.save_folder("Spots", str(folder), category_id)
+        self.library.import_paths([folder], category="Comercial", folder_id=folder_id)
+        row = self.db.one("SELECT folder_id,category FROM media WHERE path=?", (str(media_file.resolve()),))
+        self.assertEqual(int(row["folder_id"]), folder_id)
+        self.assertEqual(row["category"], "Comercial")
+        self.library.deactivate_folder(folder_id)
+        self.assertTrue(media_file.is_file())
+        self.assertEqual(int(self.db.one("SELECT COUNT(*) AS n FROM media WHERE path=?", (str(media_file.resolve()),))["n"]), 1)
 
     def test_timeline_validates_time_and_fires_once_per_day_and_minute(self):
         path = make_wav(self.root / "Ad.wav")

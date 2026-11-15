@@ -12,6 +12,8 @@ from PySide6.QtMultimedia import QMediaDevices
 from PySide6.QtWidgets import QApplication
 
 from hitmo.main_window import MainWindow
+from hitmo.database import Database
+from hitmo.operator_dialog import OperatorDialog
 
 
 class MainWindowIntegrationTests(unittest.TestCase):
@@ -70,13 +72,20 @@ class MainWindowIntegrationTests(unittest.TestCase):
             window.engine.program_finished.connect(on_finished)
             QTimer.singleShot(4000, sequence.quit)
             window._tick()
-            self.assertEqual(len(window._scheduled_queue), 1)
+            self.assertEqual(int(window.db.one("SELECT COUNT(*) AS n FROM program_occurrence_items WHERE status='planned'")["n"]), 1)
             sequence.exec()
             self.assertEqual(len(completed), 2, "Os eventos da timeline não foram reproduzidos em sequência.")
             self.assertEqual(len(window.db.all("SELECT id FROM playback_history")), 3)
             window.close()
             window.deleteLater()
             self.app.processEvents()
+
+    def test_operator_dialog_opens_with_seeded_operator(self):
+        with tempfile.TemporaryDirectory() as temp:
+            dialog = OperatorDialog(Database(Path(temp) / "operators.sqlite3"))
+            self.assertEqual(dialog.list.count(), 1)
+            self.assertIn("Operador padrão", dialog.list.item(0).text())
+            dialog.close()
 
 
 if __name__ == "__main__":

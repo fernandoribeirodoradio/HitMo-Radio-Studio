@@ -45,6 +45,17 @@ class Database:
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE IF NOT EXISTS material_categories (
+                    id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                    material_kind TEXT NOT NULL DEFAULT 'audio', icon_path TEXT NOT NULL DEFAULT '',
+                    active INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE IF NOT EXISTS media_folders (
+                    id INTEGER PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
+                    category_id INTEGER, icon_path TEXT NOT NULL DEFAULT '',
+                    active INTEGER NOT NULL DEFAULT 1,
+                    FOREIGN KEY(category_id) REFERENCES material_categories(id) ON DELETE SET NULL
+                );
                 CREATE TABLE IF NOT EXISTS operators (
                     id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
                     role TEXT NOT NULL DEFAULT 'Operador', active INTEGER NOT NULL DEFAULT 1
@@ -80,11 +91,91 @@ class Database:
                     path TEXT NOT NULL, category TEXT NOT NULL DEFAULT 'Música',
                     operator TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     ended_at TEXT NOT NULL DEFAULT '', played_seconds REAL NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'completed', planned_for TEXT NOT NULL DEFAULT '',
+                    source_type TEXT NOT NULL DEFAULT 'manual', source_ref INTEGER,
+                    error_message TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(media_id) REFERENCES media(id) ON DELETE SET NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_history_started ON playback_history(started_at DESC);
+                CREATE TABLE IF NOT EXISTS program_blocks (
+                    id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                    block_type TEXT NOT NULL CHECK(block_type IN ('Música','Comercial')),
+                    time_of_day TEXT NOT NULL, days TEXT NOT NULL DEFAULT '0,1,2,3,4,5,6',
+                    enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_program_blocks_time ON program_blocks(enabled,time_of_day);
+                CREATE TABLE IF NOT EXISTS program_block_items (
+                    id INTEGER PRIMARY KEY, block_id INTEGER NOT NULL, media_id INTEGER,
+                    position INTEGER NOT NULL, item_kind TEXT NOT NULL DEFAULT 'media',
+                    label TEXT NOT NULL DEFAULT '', pause_ms INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY(block_id) REFERENCES program_blocks(id) ON DELETE CASCADE,
+                    FOREIGN KEY(media_id) REFERENCES media(id) ON DELETE SET NULL
+                );
+                CREATE TABLE IF NOT EXISTS program_occurrences (
+                    id INTEGER PRIMARY KEY, origin_type TEXT NOT NULL,
+                    block_id INTEGER, timeline_event_id INTEGER,
+                    scheduled_for TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'planned',
+                    operator TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(block_id) REFERENCES program_blocks(id) ON DELETE SET NULL,
+                    FOREIGN KEY(timeline_event_id) REFERENCES timeline_events(id) ON DELETE SET NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_occurrence_block_time
+                    ON program_occurrences(block_id,scheduled_for) WHERE block_id IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_occurrence_event_time
+                    ON program_occurrences(timeline_event_id,scheduled_for) WHERE timeline_event_id IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS program_occurrence_items (
+                    id INTEGER PRIMARY KEY, occurrence_id INTEGER NOT NULL, source_item_id INTEGER,
+                    media_id INTEGER, position INTEGER NOT NULL, item_kind TEXT NOT NULL DEFAULT 'media',
+                    title TEXT NOT NULL DEFAULT '', artist TEXT NOT NULL DEFAULT '',
+                    path TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT '', duration REAL NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'planned', started_at TEXT NOT NULL DEFAULT '',
+                    ended_at TEXT NOT NULL DEFAULT '', error_message TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(occurrence_id) REFERENCES program_occurrences(id) ON DELETE CASCADE,
+                    FOREIGN KEY(media_id) REFERENCES media(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_occurrence_items_pending
+                    ON program_occurrence_items(status,occurrence_id,position);
                 INSERT OR IGNORE INTO operators(name, role) VALUES ('Operador padrão', 'Administrador');
             """)
+            self._migrate_columns(con)
+            for name, kind in (
+                ('Música', 'audio'), ('Comercial', 'audio'), ('Vinheta', 'audio'),
+                ('Trilha', 'audio'), ('Locução', 'audio'), ('Chamada', 'audio'),
+                ('Hora Certa', 'audio'), ('Pausa', 'audio'), ('Texto', 'text'),
+            ):
+                con.execute(
+                    "INSERT OR IGNORE INTO material_categories(name,material_kind) VALUES(?,?)",
+                    (name, kind),
+                )
+
+    @staticmethod
+    def _migrate_columns(con: sqlite3.Connection) -> None:
+        """Additive migrations only; existing user data and tables are retained."""
+        columns = {
+            "media": {
+                "folder_id": "INTEGER",
+                "icon_path": "TEXT NOT NULL DEFAULT ''",
+                "description": "TEXT NOT NULL DEFAULT ''",
+            },
+            "playlist_items": {
+                "status": "TEXT NOT NULL DEFAULT 'planned'",
+            },
+            "playback_history": {
+                "status": "TEXT NOT NULL DEFAULT 'completed'",
+                "planned_for": "TEXT NOT NULL DEFAULT ''",
+                "source_type": "TEXT NOT NULL DEFAULT 'manual'",
+                "source_ref": "INTEGER",
+                "error_message": "TEXT NOT NULL DEFAULT ''",
+            },
+            "program_occurrence_items": {
+                "duration": "REAL NOT NULL DEFAULT 0",
+            },
+        }
+        for table, additions in columns.items():
+            present = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+            for name, declaration in additions.items():
+                if name not in present:
+                    con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
     def setting(self, key: str, default: str = "") -> str:
         with self.connect() as con:
