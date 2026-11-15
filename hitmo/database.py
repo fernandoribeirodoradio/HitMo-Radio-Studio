@@ -45,6 +45,14 @@ class Database:
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE IF NOT EXISTS catalog_state (
+                    id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS program_state (
+                    id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO catalog_state(id,revision) VALUES(1,0);
+                INSERT OR IGNORE INTO program_state(id,revision) VALUES(1,0);
                 CREATE TABLE IF NOT EXISTS material_categories (
                     id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
                     material_kind TEXT NOT NULL DEFAULT 'audio', icon_path TEXT NOT NULL DEFAULT '',
@@ -90,6 +98,30 @@ class Database:
                     id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
                     role TEXT NOT NULL DEFAULT 'Operador', active INTEGER NOT NULL DEFAULT 1
                 );
+                CREATE TABLE IF NOT EXISTS api_users (
+                    id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    salt BLOB NOT NULL, password_hash BLOB NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('admin','editor','reader')),
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS api_audit_log (
+                    id INTEGER PRIMARY KEY, username TEXT NOT NULL, action TEXT NOT NULL,
+                    resource TEXT NOT NULL, resource_id TEXT NOT NULL DEFAULT '',
+                    detail TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_api_audit_created ON api_audit_log(created_at DESC);
+                CREATE TABLE IF NOT EXISTS api_program_drafts (
+                    id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                    owner TEXT NOT NULL, base_revision INTEGER NOT NULL,
+                    draft_revision INTEGER NOT NULL DEFAULT 1,
+                    payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft'
+                        CHECK(status IN ('draft','published','conflict')),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    published_revision INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_api_program_drafts_owner ON api_program_drafts(owner,status);
                 CREATE TABLE IF NOT EXISTS media (
                     id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
                     title TEXT NOT NULL, artist TEXT NOT NULL DEFAULT '',
@@ -145,7 +177,8 @@ class Database:
                     id INTEGER PRIMARY KEY, origin_type TEXT NOT NULL,
                     block_id INTEGER, timeline_event_id INTEGER,
                     scheduled_for TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'planned',
-                    operator TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    operator TEXT NOT NULL DEFAULT '', program_revision_id INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(block_id) REFERENCES program_blocks(id) ON DELETE SET NULL,
                     FOREIGN KEY(timeline_event_id) REFERENCES timeline_events(id) ON DELETE SET NULL
                 );
@@ -168,6 +201,7 @@ class Database:
                 INSERT OR IGNORE INTO operators(name, role) VALUES ('Operador padrão', 'Administrador');
             """)
             self._migrate_columns(con)
+            self._install_revision_triggers(con)
             for name, kind in (
                 ('Música', 'audio'), ('Comercial', 'audio'), ('Vinheta', 'audio'),
                 ('Trilha', 'audio'), ('Locução', 'audio'), ('Chamada', 'audio'),
@@ -186,6 +220,9 @@ class Database:
                 "folder_id": "INTEGER",
                 "icon_path": "TEXT NOT NULL DEFAULT ''",
                 "description": "TEXT NOT NULL DEFAULT ''",
+                "active": "INTEGER NOT NULL DEFAULT 1",
+                "deactivated_at": "TEXT NOT NULL DEFAULT ''",
+                "revision": "INTEGER NOT NULL DEFAULT 1",
             },
             "playlist_items": {
                 "status": "TEXT NOT NULL DEFAULT 'planned'",
@@ -200,12 +237,43 @@ class Database:
             "program_occurrence_items": {
                 "duration": "REAL NOT NULL DEFAULT 0",
             },
+            "program_occurrences": {
+                "program_revision_id": "INTEGER NOT NULL DEFAULT 0",
+            },
         }
         for table, additions in columns.items():
             present = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
             for name, declaration in additions.items():
                 if name not in present:
                     con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+    @staticmethod
+    def _install_revision_triggers(con: sqlite3.Connection) -> None:
+        for table in ("media", "material_categories", "media_folders"):
+            for operation in ("INSERT", "UPDATE", "DELETE"):
+                trigger = f"hitmo_catalog_{table}_{operation.lower()}"
+                con.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS {trigger} AFTER {operation} ON {table} "
+                    "BEGIN UPDATE catalog_state SET revision=revision+1 WHERE id=1; END"
+                )
+        for table in ("program_blocks", "program_block_items"):
+            for operation in ("INSERT", "UPDATE", "DELETE"):
+                trigger = f"hitmo_program_{table}_{operation.lower()}"
+                con.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS {trigger} AFTER {operation} ON {table} "
+                    "BEGIN UPDATE program_state SET revision=revision+1 WHERE id=1; END"
+                )
+        for operation in ("INSERT", "DELETE"):
+            trigger = f"hitmo_program_timeline_events_{operation.lower()}"
+            con.execute(
+                f"CREATE TRIGGER IF NOT EXISTS {trigger} AFTER {operation} ON timeline_events "
+                "BEGIN UPDATE program_state SET revision=revision+1 WHERE id=1; END"
+            )
+        con.execute(
+            """CREATE TRIGGER IF NOT EXISTS hitmo_program_timeline_events_update
+            AFTER UPDATE OF time_of_day,days,title,media_id,category,enabled ON timeline_events
+            BEGIN UPDATE program_state SET revision=revision+1 WHERE id=1; END"""
+        )
 
     def setting(self, key: str, default: str = "") -> str:
         with self.connect() as con:

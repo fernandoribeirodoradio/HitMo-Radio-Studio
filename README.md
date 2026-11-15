@@ -31,7 +31,20 @@ A arquitetura modular inclui biblioteca de mídia, playlist persistente com arra
 
 Para consultar sem alterar o Playlist Digital, use **Cadastro > Ler catálogo do Playlist (Folders.xml)…** e selecione o arquivo de configuração. O HitMo salva um snapshot dos campos e caminhos no SQLite e informa quais diretórios existem neste computador. Esta operação não varre mídias, não segue atalhos e não escreve no diretório do Playlist. Detalhes e limitações estão em `docs/playlist-compatibility.md`.
 
-A timeline inicia uma mídia por evento e assume o canal principal naquele momento. Ainda não há montagem automática de blocos, duração fixa de inserções, satélite/local, corte programado, crossfade ou marcadores de mixagem. A seleção de operador é registrada no histórico; autenticação e permissões individuais ainda não estão implementadas. A pré-escuta e as trilhas compartilham o dispositivo de saída configurado com o player principal. Formatos disponíveis dependem dos codecs e do backend de mídia do Windows.
+A timeline inicia uma mídia por evento e assume o canal principal naquele momento. Ainda não há montagem automática de blocos, duração fixa de inserções, satélite/local, corte programado, crossfade ou marcadores de mixagem. A seleção de operador do Studio é registrada no histórico. A API central tem autenticação e papéis próprios; isso não substitui a seleção de operador do Studio nem as permissões do Windows. A pré-escuta e as trilhas compartilham o dispositivo de saída configurado com o player principal. Formatos disponíveis dependem dos codecs e do backend de mídia do Windows.
+
+## Serviço central e acesso remoto (Fase 2A)
+
+O serviço HTTP opcional mantém o SQLite no computador da rádio. Inicialize a primeira conta administrativa e depois inicie o serviço em um terminal:
+
+```powershell
+python -m hitmo.server --init-admin
+python -m hitmo.server
+```
+
+Por padrão, o serviço escuta somente em `127.0.0.1:8765`. Para adicionar uma conta de edição, use `python -m hitmo.server --add-user NOME --role editor`. O uso pela LAN exige certificado e chave TLS: `python -m hitmo.server --host 0.0.0.0 --port 8765 --cert C:\caminho\servidor.crt --key C:\caminho\servidor.key`. Configure o firewall do Windows para permitir a porta apenas na rede privada da emissora. O serviço não publica nem abre portas na internet.
+
+Clientes remotos acessam a API autenticada e não recebem acesso ao arquivo SQLite. Os caminhos de mídia enviados à API precisam ser acessíveis pelo computador da rádio. A API não oferece comandos de reprodução. Consulte [docs/service-api.md](docs/service-api.md) para endpoints e uso do cliente Python.
 
 ## Executar o protótipo original
 

@@ -1,0 +1,223 @@
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+import wave
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from urllib.request import urlopen
+
+from hitmo.api_client import HitMoAPIClient
+from hitmo.api_service import create_api_user, create_server
+from hitmo.database import Database
+from hitmo.services import ProgrammingService
+
+
+class CentralAPIProcessTests(unittest.TestCase):
+    password = "RadioStudio#2026"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.db_path = self.root / "hitmo.sqlite3"
+        self.db = Database(self.db_path)
+        create_api_user(self.db, "test-admin", self.password, "admin")
+        create_api_user(self.db, "test-reader", self.password, "reader")
+        self.port = self._free_port()
+        self.env = os.environ.copy()
+        self.env["HITMO_DATA_DIR"] = str(self.root)
+        self.env["PYTHONPATH"] = str(Path.cwd()) + os.pathsep + self.env.get("PYTHONPATH", "")
+        self.process = None
+        self._start_server()
+        self.admin = HitMoAPIClient(f"http://127.0.0.1:{self.port}", "test-admin", self.password, timeout=2)
+        self.reader = HitMoAPIClient(f"http://127.0.0.1:{self.port}", "test-reader", self.password, timeout=2)
+
+    def tearDown(self):
+        self._stop_server()
+        self.temp.cleanup()
+
+    @staticmethod
+    def _free_port():
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+    def _start_server(self):
+        self.process = subprocess.Popen(
+            [sys.executable, "-m", "hitmo.server", "--host", "127.0.0.1", "--port", str(self.port)],
+            cwd=Path.cwd(), env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        url = f"http://127.0.0.1:{self.port}/healthz"
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                self.fail(f"API server exited early with code {self.process.returncode}")
+            try:
+                with urlopen(url, timeout=0.3) as response:
+                    if response.status == 200:
+                        return
+            except Exception:
+                time.sleep(0.05)
+        self.fail("API server did not become healthy within 8 seconds")
+
+    def _stop_server(self):
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=4)
+        self.process = None
+
+    def _write_audio(self, name: str) -> Path:
+        path = self.root / name
+        with wave.open(str(path), "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(8000)
+            out.writeframes(b"\x00\x00" * 800)
+        return path
+
+    def _material(self, name: str) -> dict:
+        return {"path": str(self._write_audio(name)), "title": Path(name).stem, "category": "Música"}
+
+    def test_startup_health_and_version_are_available(self):
+        self.assertEqual(self.admin.health()["status"], "ok")
+        version = self.admin.version()
+        self.assertIn("catalog_revision", version)
+        self.assertIn("program_revision", version)
+        self.assertEqual(version["authenticated_as"], "test-admin")
+
+    def test_authentication_and_role_permissions(self):
+        bad = HitMoAPIClient(f"http://127.0.0.1:{self.port}", "missing-user", "wrong-password-123")
+        with self.assertRaisesRegex(RuntimeError, "401"):
+            bad.version()
+        self.assertIn("categories", self.reader.categories())
+        with self.assertRaisesRegex(RuntimeError, "403"):
+            self.reader.add_material(self._material("forbidden.wav"), self.reader.version()["catalog_revision"])
+
+    def test_material_create_update_soft_deactivate_restore_and_history_preservation(self):
+        audio = self._write_audio("original.wav")
+        version = self.admin.version()
+        created = self.admin.add_material({"path": str(audio), "title": "Original", "category": "Música"}, version["catalog_revision"])
+        material_id = created["id"]
+        self.db.execute(
+            "INSERT INTO playback_history(media_id,title,path,operator) VALUES(?,?,?,?)",
+            (material_id, "Original", str(audio), "test-admin"),
+        )
+        updated = self.admin.update_material(material_id, {"title": "Renomeada", "path": str(audio), "category": "Música"}, created["revision"])
+        self.assertEqual(self.db.one("SELECT id,title FROM media WHERE path=?", (str(audio.resolve()),))["id"], material_id)
+        inactive = self.admin.deactivate_material(material_id, updated["revision"])
+        self.assertEqual(self.db.one("SELECT active FROM media WHERE id=?", (material_id,))["active"], 0)
+        self.assertEqual(self.db.one("SELECT id FROM playback_history WHERE media_id=?", (material_id,))["id"], 1)
+        self.assertTrue(audio.is_file())
+        self.assertNotIn(material_id, [row["id"] for row in self.admin.materials()["materials"]])
+        restored = self.admin.restore_material(material_id, inactive["revision"])
+        self.assertEqual(self.db.one("SELECT active FROM media WHERE id=?", (material_id,))["active"], 1)
+        self.assertIn(material_id, [row["id"] for row in self.admin.materials()["materials"]])
+        self.assertGreater(restored["revision"], updated["revision"])
+
+    def test_two_clients_using_same_catalog_revision_get_conflict(self):
+        revision = self.admin.version()["catalog_revision"]
+        payloads = [self._material("first.wav"), self._material("second.wav")]
+        clients = [self.admin, self.admin]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(client.add_material, payload, revision) for client, payload in zip(clients, payloads)]
+        results = []
+        for future in futures:
+            try:
+                results.append(future.result())
+            except RuntimeError as exc:
+                results.append(str(exc))
+        self.assertEqual(sum(isinstance(result, dict) for result in results), 1)
+        self.assertEqual(sum(isinstance(result, str) and "409" in result for result in results), 1)
+
+    def test_program_edit_conflicts_and_publish_preserves_running_occurrence(self):
+        audio = self._write_audio("music.wav")
+        media_id = self.db.execute("INSERT INTO media(path,title,category) VALUES(?,?,?)", (str(audio), "Music", "Música"))
+        programming = ProgrammingService(self.db)
+        block_id = programming.add_block("Manhã", "Música", "09:00", [0, 1, 2, 3, 4])
+        item_id = programming.add_block_item(block_id, media_id)
+        occurrence_id = self.db.execute(
+            "INSERT INTO program_occurrences(origin_type,block_id,scheduled_for,status,program_revision_id) VALUES('block',?,'2026-11-16 09:00','running',?)",
+            (block_id, self.db.one("SELECT revision FROM program_state WHERE id=1")["revision"]),
+        )
+        self.db.execute(
+            "INSERT INTO program_occurrence_items(occurrence_id,source_item_id,media_id,position,title,path,category,status) VALUES(?,?,?,?,?,?,?,'playing')",
+            (occurrence_id, item_id, media_id, 0, "Frozen title", str(audio), "Música"),
+        )
+        self.db.execute("INSERT INTO playback_history(media_id,title,path,status) VALUES(?,?,?,'playing')", (media_id, "Frozen title", str(audio)))
+
+        state = self.admin.programs()
+        block = state["blocks"][0]
+        proposed = [{"id": block_id, "name": "Manhã atualizada", "block_type": "Música", "time_of_day": "09:05", "days": [0, 1, 2, 3, 4], "items": [media_id]}]
+        draft = self.admin.create_draft("Grade nova", state["saved_revision"], proposed)
+        self.db.execute("UPDATE program_blocks SET name='Edição local concorrente' WHERE id=?", (block_id,))
+        with self.assertRaisesRegex(RuntimeError, "409"):
+            self.admin.publish_draft(draft["id"], draft["draft_revision"])
+        self.assertEqual(self.db.one("SELECT status FROM program_occurrences WHERE id=?", (occurrence_id,))["status"], "running")
+
+        state = self.admin.programs()
+        proposed[0]["name"] = "Grade publicada"
+        proposed[0]["time_of_day"] = "09:10"
+        draft = self.admin.create_draft("Grade válida", state["saved_revision"], proposed)
+        result = self.admin.publish_draft(draft["id"], draft["draft_revision"])
+        self.assertGreater(result["published_revision"], state["saved_revision"])
+        self.assertEqual(self.db.one("SELECT name,time_of_day FROM program_blocks WHERE id=?", (block_id,))["name"], "Grade publicada")
+        occurrence = self.db.one("SELECT status,program_revision_id FROM program_occurrences WHERE id=?", (occurrence_id,))
+        item = self.db.one("SELECT title,path,status FROM program_occurrence_items WHERE occurrence_id=?", (occurrence_id,))
+        self.assertEqual(occurrence["status"], "running")
+        self.assertEqual((item["title"], item["path"], item["status"]), ("Frozen title", str(audio), "playing"))
+        self.assertEqual(self.db.one("SELECT status FROM playback_history")["status"], "playing")
+
+    def test_repeated_clients_and_program_drafts_are_isolated(self):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(self.reader.categories), pool.submit(self.admin.folders)]
+        self.assertEqual(len(futures[0].result()["categories"]), 9)
+        self.assertIn("folders", futures[1].result())
+        rev = self.admin.programs()["saved_revision"]
+        first = self.admin.create_draft("Rascunho A", rev, {"blocks": []}["blocks"])
+        self.assertEqual(self.admin.get_draft(first["id"])["status"], "draft")
+
+    def test_publish_rechecks_materials_after_draft_was_created(self):
+        audio = self._write_audio("scheduled.wav")
+        media_id = self.db.execute(
+            "INSERT INTO media(path,title,category) VALUES(?,?,?)",
+            (str(audio), "Scheduled", "Música"),
+        )
+        state = self.admin.programs()
+        draft = self.admin.create_draft(
+            "Material válido ao criar",
+            state["saved_revision"],
+            [{"name": "Bloco", "block_type": "Música", "time_of_day": "10:00", "days": [0], "items": [media_id]}],
+        )
+        self.admin.deactivate_material(media_id, self.admin.version()["catalog_revision"])
+        with self.assertRaisesRegex(RuntimeError, "409"):
+            self.admin.publish_draft(draft["id"], draft["draft_revision"])
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM program_blocks")["n"], 0)
+
+    def test_http_is_refused_on_lan_without_tls_and_no_audio_route_exists(self):
+        with self.assertRaisesRegex(ValueError, "TLS"):
+            create_server(self.db, "0.0.0.0", 0)
+        with self.assertRaisesRegex(RuntimeError, "404"):
+            self.admin.request("POST", "/api/v1/audio/play", body={})
+
+    def test_restart_keeps_users_catalog_and_history(self):
+        audio = self._write_audio("persistent.wav")
+        revision = self.admin.version()["catalog_revision"]
+        result = self.admin.add_material({"path": str(audio), "title": "Persistent", "category": "Música"}, revision)
+        self.db.execute("INSERT INTO playback_history(media_id,title,path) VALUES(?,?,?)", (result["id"], "Persistent", str(audio)))
+        self._stop_server()
+        self._start_server()
+        self.admin = HitMoAPIClient(f"http://127.0.0.1:{self.port}", "test-admin", self.password)
+        self.assertEqual(self.admin.materials()["materials"][0]["title"], "Persistent")
+        self.assertEqual(len(self.admin.history()["history"]), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import csv
+import ipaddress
 import json
 import os
 import sqlite3
+import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import QProcess, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -160,6 +162,19 @@ class MainWindow(QMainWindow):
         self._refresh_library()
         self._apply_theme()
         self._restore_window()
+        self._api_process = QProcess(self)
+        self._api_process.finished.connect(self._api_process_finished)
+        self._api_process.errorOccurred.connect(self._api_process_error)
+        self._api_host = self.db.setting("api_host", "127.0.0.1")
+        try:
+            configured_port = int(self.db.setting("api_port", "8765"))
+        except ValueError:
+            configured_port = 8765
+        self._api_port = configured_port if 1 <= configured_port <= 65535 else 8765
+        self._api_poll = QTimer(self)
+        self._api_poll.timeout.connect(self._refresh_api_status)
+        self._api_poll.start(2000)
+        self._refresh_api_status()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(500)
@@ -186,6 +201,15 @@ class MainWindow(QMainWindow):
         settings = QPushButton("Preferências")
         settings.clicked.connect(self._open_settings)
         toolbar.addWidget(settings)
+        toolbar.addSeparator()
+        self.api_status_label = QLabel("API central · offline")
+        toolbar.addWidget(self.api_status_label)
+        api_menu = self.menuBar().addMenu("Serviço central")
+        api_menu.addAction("Ativar serviço local…", self._start_api_service)
+        api_menu.addAction("Parar serviço iniciado pelo Studio", self._stop_api_service)
+        api_menu.addAction("Configurar endereço e porta…", self._configure_api_service)
+        api_menu.addAction("Clientes autenticados recentes…", self._show_api_clients)
+        api_menu.addAction("Abrir registro de erros", self._open_api_log)
         toolbar.addSeparator()
         self.clock_label = QLabel("--:--:--")
         self.clock_label.setObjectName("clockLabel")
@@ -527,6 +551,92 @@ class MainWindow(QMainWindow):
         if AppSettingsDialog(self.db, self.engine, self).exec():
             self.station_label.setText(self.db.setting("station_name", "HitMo Radio"))
             self.auto_badge.setText("AUTO · ON" if self.db.setting("auto_advance", "1") == "1" else "AUTO · OFF")
+
+    def _configure_api_service(self):
+        host, accepted = QInputDialog.getText(self, "Serviço central", "Endereço local (LAN com TLS deve ser iniciada pela linha de comando):", text=self._api_host)
+        if not accepted:
+            return
+        host = host.strip()
+        if not host:
+            QMessageBox.warning(self, "Endereço inválido", "Informe um endereço de escuta.")
+            return
+        try:
+            loopback = host.casefold() == "localhost" or ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = False
+        if not loopback:
+            QMessageBox.warning(self, "Endereço protegido", "A interface inicia HTTP somente em loopback. Para LAN, inicie o serviço com TLS pela linha de comando; veja docs/service-api.md.")
+            return
+        port, accepted = QInputDialog.getInt(self, "Serviço central", "Porta:", value=self._api_port, min=1, max=65535)
+        if not accepted:
+            return
+        self._api_host, self._api_port = host, port
+        self.db.set_setting("api_host", host)
+        self.db.set_setting("api_port", str(port))
+        self._refresh_api_status()
+
+    def _start_api_service(self):
+        if self._api_process.state() != QProcess.ProcessState.NotRunning:
+            self.statusBar().showMessage("O serviço iniciado pelo Studio já está ativo.", 5000)
+            return
+        self._api_process.setWorkingDirectory(str(Path(__file__).resolve().parent.parent))
+        self._api_process.start(sys.executable, ["-m", "hitmo.server", "--host", self._api_host, "--port", str(self._api_port)])
+        self.statusBar().showMessage("Iniciando o serviço central…", 5000)
+        QTimer.singleShot(1500, self._refresh_api_status)
+
+    def _stop_api_service(self):
+        if self._api_process.state() == QProcess.ProcessState.NotRunning:
+            self.statusBar().showMessage("Nenhum serviço iniciado pelo Studio está ativo.", 5000)
+            return
+        self._api_process.terminate()
+        if not self._api_process.waitForFinished(2500):
+            self._api_process.kill()
+            self._api_process.waitForFinished(1500)
+        self._refresh_api_status()
+
+    def _refresh_api_status(self):
+        from .api_client import HitMoAPIClient
+        client = HitMoAPIClient(f"http://{self._api_host}:{self._api_port}", "", "", timeout=0.35)
+        try:
+            status = client.health()
+        except (ConnectionError, ValueError):
+            state = "iniciando" if self._api_process.state() != QProcess.ProcessState.NotRunning else "offline"
+            self.api_status_label.setText(f"API central · {state}")
+            return
+        self.api_status_label.setText(f"API central · online · v{status.get('version', '?')}")
+
+    def _api_process_finished(self, exit_code, exit_status):
+        self._refresh_api_status()
+        if exit_code:
+            self.statusBar().showMessage(f"O serviço central encerrou com código {exit_code}. Consulte o registro de erros.", 9000)
+
+    def _api_process_error(self, error):
+        self.api_status_label.setText("API central · erro ao iniciar")
+        self.statusBar().showMessage(f"Não foi possível iniciar o serviço central: {self._api_process.errorString()}", 10000)
+
+    def _show_api_clients(self):
+        username, accepted = QInputDialog.getText(self, "Clientes recentes", "Usuário administrador da API:")
+        if not accepted or not username.strip():
+            return
+        password, accepted = QInputDialog.getText(self, "Clientes recentes", "Senha:", QLineEdit.EchoMode.Password)
+        if not accepted:
+            return
+        from .api_client import HitMoAPIClient
+        try:
+            clients = HitMoAPIClient(f"http://{self._api_host}:{self._api_port}", username.strip(), password, timeout=1.0).clients()["clients"]
+        except (ConnectionError, RuntimeError) as exc:
+            QMessageBox.warning(self, "Serviço central", str(exc))
+            return
+        listing = "\n".join(f"{row['username']} · {row['address']}" for row in clients) or "Nenhum cliente autenticado recentemente."
+        QMessageBox.information(self, "Clientes recentes", listing)
+
+    def _open_api_log(self):
+        from .database import default_data_dir
+        path = default_data_dir() / "logs" / "api.log"
+        if not path.is_file():
+            QMessageBox.information(self, "Registro de erros", "O serviço ainda não criou o arquivo de registro.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def _open_program_manager(self):
         ProgramManagerDialog(self.db, self).exec()
@@ -1091,6 +1201,11 @@ class MainWindow(QMainWindow):
         self.engine.stop_program()
         self.engine.stop_preview()
         self.engine.stop_loop()
+        if self._api_process.state() != QProcess.ProcessState.NotRunning:
+            self._api_process.terminate()
+            if not self._api_process.waitForFinished(2000):
+                self._api_process.kill()
+                self._api_process.waitForFinished(1000)
         self.db.set_setting("window_geometry", bytes(self.saveGeometry()).hex())
         self.db.set_setting("window_state", bytes(self.saveState()).hex())
         event.accept()

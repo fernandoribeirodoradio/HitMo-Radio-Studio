@@ -179,8 +179,8 @@ class MediaLibrary:
     def search(self, text: str = "", category: str = "Todos"):
         term = f"%{text.strip()}%"
         if category == "Todos":
-            return self.db.all("SELECT * FROM media WHERE title LIKE ? OR artist LIKE ? OR path LIKE ? ORDER BY title COLLATE NOCASE", (term, term, term))
-        return self.db.all("SELECT * FROM media WHERE category=? AND (title LIKE ? OR artist LIKE ? OR path LIKE ?) ORDER BY title COLLATE NOCASE", (category, term, term, term))
+            return self.db.all("SELECT * FROM media WHERE active=1 AND (title LIKE ? OR artist LIKE ? OR path LIKE ?) ORDER BY title COLLATE NOCASE", (term, term, term))
+        return self.db.all("SELECT * FROM media WHERE active=1 AND category=? AND (title LIKE ? OR artist LIKE ? OR path LIKE ?) ORDER BY title COLLATE NOCASE", (category, term, term, term))
 
 
 class PlaylistService:
@@ -267,9 +267,11 @@ class ProgrammingService:
 
     def add_block_item(self, block_id: int, media_id: int) -> int:
         block = self.db.one("SELECT block_type FROM program_blocks WHERE id=?", (block_id,))
-        media = self.db.one("SELECT category FROM media WHERE id=?", (media_id,))
+        media = self.db.one("SELECT category,active FROM media WHERE id=?", (media_id,))
         if not block or not media:
             raise ValueError("Bloco ou material não encontrado.")
+        if not bool(media["active"]):
+            raise ValueError("Material inativo não pode ser adicionado a uma nova programação.")
         category = self.db.one("SELECT material_kind FROM material_categories WHERE name=? AND active=1", (media["category"],))
         if category and category["material_kind"] != "audio":
             raise ValueError("Somente materiais de áudio podem entrar em um bloco executável.")
@@ -303,6 +305,7 @@ class ProgrammingService:
         weekday = now.weekday()
         created: list[int] = []
         with self.db.connect() as con:
+            program_revision = int(con.execute("SELECT revision FROM program_state WHERE id=1").fetchone()["revision"])
             blocks = con.execute("SELECT * FROM program_blocks WHERE enabled=1 AND time_of_day=?", (now.strftime("%H:%M"),)).fetchall()
             for block in blocks:
                 if weekday not in {int(x) for x in block["days"].split(",") if x.strip().isdigit()}:
@@ -314,8 +317,8 @@ class ProgrammingService:
                 if not items:
                     continue
                 cursor = con.execute(
-                    "INSERT OR IGNORE INTO program_occurrences(origin_type,block_id,scheduled_for,status) VALUES('block',?,?,'planned')",
-                    (int(block["id"]), scheduled_for),
+                    "INSERT OR IGNORE INTO program_occurrences(origin_type,block_id,scheduled_for,status,program_revision_id) VALUES('block',?,?,'planned',?)",
+                    (int(block["id"]), scheduled_for, program_revision),
                 )
                 if cursor.rowcount:
                     occurrence_id = int(cursor.lastrowid)
@@ -333,8 +336,8 @@ class ProgrammingService:
                 if weekday not in {int(x) for x in event["days"].split(",") if x.strip().isdigit()}:
                     continue
                 cursor = con.execute(
-                    "INSERT OR IGNORE INTO program_occurrences(origin_type,timeline_event_id,scheduled_for,status) VALUES('timeline',?,?,'planned')",
-                    (int(event["id"]), scheduled_for),
+                    "INSERT OR IGNORE INTO program_occurrences(origin_type,timeline_event_id,scheduled_for,status,program_revision_id) VALUES('timeline',?,?,'planned',?)",
+                    (int(event["id"]), scheduled_for, program_revision),
                 )
                 if cursor.rowcount:
                     occurrence_id = int(cursor.lastrowid)

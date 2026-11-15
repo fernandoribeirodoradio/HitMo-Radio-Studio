@@ -87,6 +87,26 @@ class MainWindowIntegrationTests(unittest.TestCase):
             self.assertIn("Operador padrão", dialog.list.item(0).text())
             dialog.close()
 
+    def test_central_service_controls_exist_without_server(self):
+        previous_data_dir = os.environ.get("HITMO_DATA_DIR")
+        def restore_data_dir():
+            if previous_data_dir is None:
+                os.environ.pop("HITMO_DATA_DIR", None)
+            else:
+                os.environ["HITMO_DATA_DIR"] = previous_data_dir
+        self.addCleanup(restore_data_dir)
+        with tempfile.TemporaryDirectory() as temp:
+            os.environ["HITMO_DATA_DIR"] = temp
+            window = MainWindow()
+            self.assertIn("offline", window.api_status_label.text())
+            service_menu = next(action.menu() for action in window.menuBar().actions() if action.text() == "Serviço central")
+            actions = [action.text() for action in service_menu.actions()]
+            self.assertIn("Ativar serviço local…", actions)
+            self.assertIn("Clientes autenticados recentes…", actions)
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main()
