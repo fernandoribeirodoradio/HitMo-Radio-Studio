@@ -56,6 +56,36 @@ class Database:
                     active INTEGER NOT NULL DEFAULT 1,
                     FOREIGN KEY(category_id) REFERENCES material_categories(id) ON DELETE SET NULL
                 );
+                CREATE TABLE IF NOT EXISTS playlist_catalogs (
+                    id INTEGER PRIMARY KEY, source_path TEXT NOT NULL,
+                    version TEXT NOT NULL DEFAULT '', declared_folder_count INTEGER NOT NULL DEFAULT 0,
+                    declared_shared_count INTEGER NOT NULL DEFAULT 0,
+                    imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_playlist_catalog_source
+                    ON playlist_catalogs(source_path,imported_at DESC);
+                CREATE TABLE IF NOT EXISTS playlist_shared_roots (
+                    catalog_id INTEGER NOT NULL, position INTEGER NOT NULL,
+                    server TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(catalog_id,position),
+                    FOREIGN KEY(catalog_id) REFERENCES playlist_catalogs(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS playlist_folder_entries (
+                    catalog_id INTEGER NOT NULL, position INTEGER NOT NULL,
+                    playlist_id INTEGER NOT NULL,
+                    title TEXT NOT NULL DEFAULT '', type_code TEXT NOT NULL DEFAULT '',
+                    target TEXT NOT NULL DEFAULT '', icon_location TEXT NOT NULL DEFAULT '',
+                    shortcut_arguments TEXT NOT NULL DEFAULT '', shortcut_path_name TEXT NOT NULL DEFAULT '',
+                    icon_index INTEGER, output TEXT NOT NULL DEFAULT '',
+                    total_files INTEGER NOT NULL DEFAULT 0, dbf_id TEXT NOT NULL DEFAULT '',
+                    target_exists INTEGER NOT NULL DEFAULT 0,
+                    imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(catalog_id,playlist_id),
+                    FOREIGN KEY(catalog_id) REFERENCES playlist_catalogs(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_playlist_folder_source
+                    ON playlist_folder_entries(catalog_id,position,title COLLATE NOCASE);
                 CREATE TABLE IF NOT EXISTS operators (
                     id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
                     role TEXT NOT NULL DEFAULT 'Operador', active INTEGER NOT NULL DEFAULT 1

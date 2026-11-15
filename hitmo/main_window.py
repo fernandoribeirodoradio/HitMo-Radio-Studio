@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from .config_manager import ConfigManagerDialog
 from .database import Database
 from .operator_dialog import OperatorDialog
 from .programming_dialog import ProgramManagerDialog
+from .playlist_compat import PlaylistConfigImporter
 from .services import MediaLibrary, PlaylistService, ProgrammingService, TimelineService
 
 ROLE = Qt.ItemDataRole.UserRole
@@ -395,6 +397,8 @@ class MainWindow(QMainWindow):
         tools_menu = self.menuBar().addMenu("Cadastro")
         manager = tools_menu.addAction("Config Manager · materiais, pastas e categorias…")
         manager.triggered.connect(self._open_config)
+        playlist_catalog = tools_menu.addAction("Ler catálogo do Playlist (Folders.xml)…")
+        playlist_catalog.triggered.connect(self._import_playlist_catalog)
         operators = tools_menu.addAction("Operadores…")
         operators.triggered.connect(self._manage_operators)
         settings_menu = self.menuBar().addMenu("Preferências")
@@ -482,6 +486,42 @@ class MainWindow(QMainWindow):
         self._refresh_category_filter()
         self._refresh_library()
         self._refresh_playlist()
+
+    def _import_playlist_catalog(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Selecionar configuração de pastas do Playlist Digital",
+            str(Path.home()),
+            "Configuração XML (Folders.xml);;XML (*.xml)",
+        )
+        if not path:
+            return
+        try:
+            result = PlaylistConfigImporter(self.db).import_file(path)
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            QMessageBox.warning(self, "Catálogo Playlist", str(exc))
+            return
+        missing = self.db.all(
+            "SELECT playlist_id,title,target FROM playlist_folder_entries WHERE catalog_id=? AND target_exists=0 ORDER BY position",
+            (result.snapshot_id,),
+        )
+        missing_text = ""
+        if missing:
+            missing_text = "\n\nPastas ausentes neste computador:\n" + "\n".join(
+                f"• {row['title']}: {row['target'] or '(caminho vazio)'}" for row in missing[:12]
+            )
+            if len(missing) > 12:
+                missing_text += f"\n… e mais {len(missing) - 12}"
+        QMessageBox.information(
+            self,
+            "Catálogo Playlist importado",
+            f"Snapshot somente de leitura salvo no SQLite.\n"
+            f"Pastas catalogadas: {result.folder_count}\n"
+            f"Diretórios encontrados: {result.existing_target_count}\n"
+            f"Diretórios ausentes: {result.missing_target_count}\n\n"
+            "Nenhuma mídia foi varrida e o arquivo de origem não foi alterado."
+            f"{missing_text}",
+        )
 
     def _open_settings(self):
         if AppSettingsDialog(self.db, self.engine, self).exec():
