@@ -88,6 +88,84 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(len(retained), 2)
         self.assertTrue(all(Path(row["path"]).is_file() for row in retained))
 
+    def test_next_block_discards_only_unstarted_overrun_items_and_preserves_history(self):
+        files = [make_wav(self.root / f"transition-{index}.wav") for index in range(4)]
+        self.library.import_paths(files, category="Música")
+        media = self.db.all("SELECT id,title,path FROM media ORDER BY id")
+        earlier = self.programming.add_block("Bloco 12h", "Música", "12:00", [6])
+        previous_items = [self.programming.add_block_item(earlier, int(row["id"])) for row in media[:3]]
+        old_occurrence = self.programming.due(datetime(2026, 11, 15, 12, 0))[0]
+        self.programming.set_occurrence_item_status(
+            int(self.db.one("SELECT id FROM program_occurrence_items WHERE occurrence_id=? ORDER BY position LIMIT 1", (old_occurrence,))["id"]),
+            "playing",
+        )
+        history_id = self.db.execute(
+            "INSERT INTO playback_history(media_id,title,path,category,status) VALUES(?,?,?,'Música','completed')",
+            (int(media[0]["id"]), "Já foi ao ar", str(media[0]["path"])),
+        )
+        incoming = self.programming.add_block("Bloco 12h01", "Música", "12:01", [6])
+        self.programming.add_block_item(incoming, int(media[3]["id"]))
+
+        created = self.programming.due(datetime(2026, 11, 15, 12, 1))
+        self.assertEqual(len(created), 1)
+        old_items = self.db.all("SELECT source_item_id,status,error_message FROM program_occurrence_items WHERE occurrence_id=? ORDER BY position", (old_occurrence,))
+        self.assertEqual([row["source_item_id"] for row in old_items], previous_items)
+        self.assertEqual([row["status"] for row in old_items], ["playing", "skipped", "skipped"])
+        self.assertTrue(all("excedente" in row["error_message"] for row in old_items[1:]))
+        new_item = self.db.one("SELECT status FROM program_occurrence_items WHERE occurrence_id=?", (created[0],))
+        self.assertEqual(new_item["status"], "planned")
+        history = self.db.one("SELECT title,status FROM playback_history WHERE id=?", (history_id,))
+        self.assertEqual((history["title"], history["status"]), ("Já foi ao ar", "completed"))
+        self.assertEqual(self.programming.due(datetime(2026, 11, 15, 12, 1)), [])
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM program_occurrences WHERE scheduled_for='2026-11-15 12:01'")["n"], 1)
+
+    def test_same_minute_blocks_are_prepared_once_without_skipping_each_other(self):
+        files = [make_wav(self.root / f"same-minute-{index}.wav") for index in range(2)]
+        self.library.import_paths(files, category="Música")
+        media_ids = [int(row["id"]) for row in self.db.all("SELECT id FROM media ORDER BY id")]
+        for index, media_id in enumerate(media_ids):
+            block_id = self.programming.add_block(f"Mesmo minuto {index}", "Música", "12:30", [6])
+            self.programming.add_block_item(block_id, media_id)
+        created = self.programming.due(datetime(2026, 11, 15, 12, 30))
+        self.assertEqual(len(created), 2)
+        states = self.db.all("SELECT status FROM program_occurrence_items ORDER BY occurrence_id")
+        self.assertEqual([row["status"] for row in states], ["planned", "planned"])
+        self.assertEqual(self.programming.due(datetime(2026, 11, 15, 12, 30)), [])
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM program_occurrences")["n"], 2)
+
+    def test_pending_occurrence_survives_recovery_without_duplicate_dispatch(self):
+        files = [make_wav(self.root / f"recovery-{index}.wav") for index in range(2)]
+        self.library.import_paths(files, category="Música")
+        media_ids = [int(row["id"]) for row in self.db.all("SELECT id FROM media ORDER BY id")]
+        block_id = self.programming.add_block("Retomada", "Música", "12:30", [6])
+        for media_id in media_ids:
+            self.programming.add_block_item(block_id, media_id)
+        occurrence_id = self.programming.due(datetime(2026, 11, 15, 12, 30))[0]
+        first, second = self.db.all("SELECT id FROM program_occurrence_items WHERE occurrence_id=? ORDER BY position", (occurrence_id,))
+        self.programming.set_occurrence_item_status(int(first["id"]), "playing")
+
+        ProgrammingService(Database(self.db.path)).recover_interrupted()
+
+        statuses = self.db.all("SELECT status FROM program_occurrence_items WHERE occurrence_id=? ORDER BY position", (occurrence_id,))
+        self.assertEqual([row["status"] for row in statuses], ["interrupted", "planned"])
+        self.assertEqual(int(self.programming.next_occurrence_item()["id"]), int(second["id"]))
+        self.assertEqual(self.programming.due(datetime(2026, 11, 15, 12, 30)), [])
+
+    def test_empty_block_keeps_existing_ignore_behavior(self):
+        self.programming.add_block("Bloco sem inserções", "Música", "12:30", [6])
+        self.assertEqual(self.programming.due(datetime(2026, 11, 15, 12, 30)), [])
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM program_occurrences")["n"], 0)
+
+    def test_missing_file_is_snapshotted_as_pending_material(self):
+        path = self.root / "offline" / "ausente.wav"
+        media_id = self.db.execute("INSERT INTO media(path,title,category) VALUES(?,?,?)", (str(path), "Ausente", "Música"))
+        block_id = self.programming.add_block("Arquivo offline", "Música", "12:30", [6])
+        self.programming.add_block_item(block_id, media_id)
+        occurrence_id = self.programming.due(datetime(2026, 11, 15, 12, 30))[0]
+        item = self.db.one("SELECT title,path,status FROM program_occurrence_items WHERE occurrence_id=?", (occurrence_id,))
+        self.assertEqual((item["title"], item["path"], item["status"]), ("Ausente", str(path), "planned"))
+        self.assertFalse(Path(item["path"]).exists())
+
     def test_configured_material_folder_and_category_do_not_delete_files(self):
         folder = self.root / "Spots"
         media_file = make_wav(folder / "spot.wav")

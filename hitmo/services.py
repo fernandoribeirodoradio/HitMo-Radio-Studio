@@ -314,6 +314,7 @@ class ProgrammingService:
         scheduled_for = now.strftime("%Y-%m-%d %H:%M")
         weekday = now.weekday()
         created: list[int] = []
+        created_block = False
         with self.db.connect() as con:
             program_revision = int(con.execute("SELECT revision FROM program_state WHERE id=1").fetchone()["revision"])
             blocks = con.execute("SELECT * FROM program_blocks WHERE enabled=1 AND time_of_day=?", (now.strftime("%H:%M"),)).fetchall()
@@ -333,11 +334,31 @@ class ProgrammingService:
                 if cursor.rowcount:
                     occurrence_id = int(cursor.lastrowid)
                     created.append(occurrence_id)
+                    created_block = True
                     for item in items:
                         con.execute(
                             "INSERT INTO program_occurrence_items(occurrence_id,source_item_id,media_id,position,item_kind,title,artist,path,category,duration) VALUES(?,?,?,?,?,?,?,?,?,?)",
                             (occurrence_id, int(item["id"]), int(item["media_id"]), int(item["position"]), item["item_kind"], item["title"], item["artist"], item["path"], item["category"], item["duration"]),
                         )
+            if created_block:
+                # The next scheduled block is the documented cutoff. Never stop
+                # an item already loading/playing; discard only remaining inserts
+                # from older block occurrences, leaving their audit snapshots.
+                con.execute(
+                    "UPDATE program_occurrence_items "
+                    "SET status='skipped',ended_at=CURRENT_TIMESTAMP,"
+                    "error_message='Inserção excedente descartada no horário do próximo bloco' "
+                    "WHERE status='planned' AND occurrence_id IN ("
+                    "SELECT id FROM program_occurrences WHERE origin_type='block' AND scheduled_for<?)",
+                    (scheduled_for,),
+                )
+                con.execute(
+                    "UPDATE program_occurrences SET status='interrupted' "
+                    "WHERE origin_type='block' AND scheduled_for<? AND status IN ('planned','running') "
+                    "AND NOT EXISTS (SELECT 1 FROM program_occurrence_items i WHERE i.occurrence_id=program_occurrences.id "
+                    "AND i.status IN ('planned','loading','playing','paused'))",
+                    (scheduled_for,),
+                )
             events = con.execute(
                 "SELECT t.*,m.id AS actual_media_id,m.title AS media_title,m.artist,m.path,m.category AS media_category,m.duration FROM timeline_events t JOIN media m ON m.id=t.media_id WHERE t.enabled=1 AND t.time_of_day=? AND t.last_fired<>?",
                 (now.strftime("%H:%M"), scheduled_for),

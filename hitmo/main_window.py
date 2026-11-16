@@ -1171,15 +1171,17 @@ class MainWindow(QMainWindow):
         self.clock_label.setText(now.strftime("%H:%M:%S"))
         due = self.programming.due(now)
         if due:
-            if self._current:
-                queue_id = self._current_queue_id
-                self._end_current("interrupted", "Interrompido pelo início de programação agendada")
-                if queue_id:
-                    self.playlist.set_status(queue_id, "planned")
-                self.engine.stop_program()
-                self._clear_current()
-            self.statusBar().showMessage(f"Programação agendada · {len(due)} ocorrência(s) persistida(s)", 8000)
-            self._play_next_pending()
+            pending_items = self.db.one(
+                "SELECT COUNT(*) AS n FROM program_occurrence_items WHERE status='planned'"
+            )["n"]
+            self.statusBar().showMessage(
+                f"Programação agendada · {len(due)} ocorrência(s) persistida(s) · {pending_items} inserção(ões) pendente(s)",
+                8000,
+            )
+            # A due occurrence is prepared in SQLite immediately, but PGM changes
+            # source only when no item is active. Natural end/error advances it.
+            if not self._current:
+                self._play_next_pending()
             self._refresh_timeline()
             self._refresh_program_blocks()
 
