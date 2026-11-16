@@ -141,6 +141,9 @@ class PlaylistCompatibilityTests(unittest.TestCase):
         occurrence_columns = {row["name"] for row in migrated.all("PRAGMA table_info(program_occurrences)")}
         self.assertIn("transition_policy", occurrence_columns)
         self.assertIn("fixed_fade_ms", occurrence_columns)
+        self.assertIn("dispatch_delay_ms", occurrence_columns)
+        self.assertIn("dispatch_reason", occurrence_columns)
+        self.assertTrue(migrated.one("SELECT name FROM sqlite_master WHERE type='table' AND name='scheduler_decisions'"))
         folder_columns = {row["name"] for row in migrated.all("PRAGMA table_info(media_folders)")}
         self.assertIn("jingle_rotation_enabled", folder_columns)
         self.assertIn("jingle_repeat_cooldown", folder_columns)

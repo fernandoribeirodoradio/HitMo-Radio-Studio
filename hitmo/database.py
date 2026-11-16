@@ -201,6 +201,8 @@ class Database:
                     operator TEXT NOT NULL DEFAULT '', program_revision_id INTEGER NOT NULL DEFAULT 0,
                     transition_policy TEXT NOT NULL DEFAULT 'discard_insertions',
                     fixed_fade_ms INTEGER NOT NULL DEFAULT 1000,
+                    dispatch_delay_ms INTEGER NOT NULL DEFAULT 0,
+                    dispatch_reason TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(block_id) REFERENCES program_blocks(id) ON DELETE SET NULL,
                     FOREIGN KEY(timeline_event_id) REFERENCES timeline_events(id) ON DELETE SET NULL
@@ -222,6 +224,18 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_occurrence_items_pending
                     ON program_occurrence_items(status,occurrence_id,position);
+                CREATE TABLE IF NOT EXISTS scheduler_decisions (
+                    id INTEGER PRIMARY KEY,
+                    origin_type TEXT NOT NULL,
+                    source_id INTEGER NOT NULL,
+                    scheduled_for TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    decided_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(origin_type,source_id,scheduled_for,decision)
+                );
+                CREATE INDEX IF NOT EXISTS idx_scheduler_decisions_time
+                    ON scheduler_decisions(scheduled_for DESC,origin_type,source_id);
                 INSERT OR IGNORE INTO operators(name, role) VALUES ('Operador padrão', 'Administrador');
             """)
             self._migrate_columns(con)
@@ -277,6 +291,8 @@ class Database:
                 "program_revision_id": "INTEGER NOT NULL DEFAULT 0",
                 "transition_policy": "TEXT NOT NULL DEFAULT 'discard_insertions'",
                 "fixed_fade_ms": "INTEGER NOT NULL DEFAULT 1000",
+                "dispatch_delay_ms": "INTEGER NOT NULL DEFAULT 0",
+                "dispatch_reason": "TEXT NOT NULL DEFAULT ''",
             },
             "program_blocks": {
                 "transition_policy": "TEXT NOT NULL DEFAULT 'discard_insertions'",

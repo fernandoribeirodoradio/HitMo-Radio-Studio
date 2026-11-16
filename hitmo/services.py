@@ -16,6 +16,9 @@ except ImportError:  # useful fallback when only the required GUI dependency is 
     MutagenFile = None
 
 SUPPORTED_AUDIO = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus"}
+SCHEDULER_LATE_GRACE_SECONDS = 30
+FIXED_LATE_GRACE_MS = 1000
+SCHEDULER_RECOVERY_HORIZON_DAYS = 31
 
 
 def media_category(path: Path) -> str:
@@ -502,15 +505,23 @@ class ProgrammingService:
         target, block_id, fade_ms = min(candidates)
         return {"at": target, "block_id": block_id, "fade_ms": fade_ms}
 
-    def due(self, now: datetime):
+    def due(
+        self, now: datetime, block_ids: set[int] | None = None,
+        timeline_event_ids: set[int] | None = None,
+    ):
         scheduled_for = now.strftime("%Y-%m-%d %H:%M")
         weekday = now.weekday()
         created: list[int] = []
         created_blocks: list[sqlite3.Row] = []
         with self.db.connect() as con:
             program_revision = int(con.execute("SELECT revision FROM program_state WHERE id=1").fetchone()["revision"])
-            blocks = con.execute("SELECT * FROM program_blocks WHERE enabled=1 AND time_of_day=?", (now.strftime("%H:%M"),)).fetchall()
+            blocks = con.execute(
+                "SELECT * FROM program_blocks WHERE enabled=1 AND time_of_day=? ORDER BY id",
+                (now.strftime("%H:%M"),),
+            ).fetchall()
             for block in blocks:
+                if block_ids is not None and int(block["id"]) not in block_ids:
+                    continue
                 if weekday not in {int(x) for x in block["days"].split(",") if x.strip().isdigit()}:
                     continue
                 items = con.execute(
@@ -607,10 +618,12 @@ class ProgrammingService:
                     (scheduled_for,),
                 )
             events = con.execute(
-                "SELECT t.*,m.id AS actual_media_id,m.title AS media_title,m.artist,m.path,m.category AS media_category,m.duration FROM timeline_events t JOIN media m ON m.id=t.media_id WHERE t.enabled=1 AND t.time_of_day=? AND t.last_fired<>?",
+                "SELECT t.*,m.id AS actual_media_id,m.title AS media_title,m.artist,m.path,m.category AS media_category,m.duration FROM timeline_events t JOIN media m ON m.id=t.media_id WHERE t.enabled=1 AND t.time_of_day=? AND t.last_fired<>? ORDER BY t.id",
                 (now.strftime("%H:%M"), scheduled_for),
             ).fetchall()
             for event in events:
+                if timeline_event_ids is not None and int(event["id"]) not in timeline_event_ids:
+                    continue
                 if weekday not in {int(x) for x in event["days"].split(",") if x.strip().isdigit()}:
                     continue
                 cursor = con.execute(
@@ -627,18 +640,418 @@ class ProgrammingService:
                     con.execute("UPDATE timeline_events SET last_fired=? WHERE id=?", (scheduled_for, int(event["id"])))
         return created
 
+    def _record_scheduler_decision(
+        self, origin_type: str, source_id: int, scheduled_for: str,
+        decision: str, reason: str, con: sqlite3.Connection | None = None,
+    ) -> None:
+        execute = con.execute if con is not None else self.db.execute
+        execute(
+            "INSERT OR IGNORE INTO scheduler_decisions(origin_type,source_id,scheduled_for,decision,reason) "
+            "VALUES(?,?,?,?,?)",
+            (origin_type, source_id, scheduled_for, decision, reason),
+        )
+
+    def _slot_candidates(self, start: datetime, end: datetime) -> dict[datetime, dict[str, list[int]]]:
+        blocks = self.db.all(
+            "SELECT id,time_of_day,days,transition_policy FROM program_blocks "
+            "WHERE enabled=1 AND EXISTS (SELECT 1 FROM program_block_items i WHERE i.block_id=program_blocks.id) "
+            "ORDER BY id"
+        )
+        events = self.db.all(
+            "SELECT id,time_of_day,days FROM timeline_events WHERE enabled=1 AND media_id IS NOT NULL ORDER BY id"
+        )
+        slots: dict[datetime, dict[str, list[int]]] = {}
+        day = start.date()
+        while day <= end.date():
+            weekday = day.weekday()
+            for row in blocks:
+                if weekday not in {int(value) for value in str(row["days"]).split(",") if value.strip().isdigit()}:
+                    continue
+                scheduled = datetime.combine(day, datetime.strptime(row["time_of_day"], "%H:%M").time())
+                if start < scheduled <= end:
+                    slots.setdefault(scheduled, {"blocks": [], "events": []})["blocks"].append(int(row["id"]))
+            for row in events:
+                if weekday not in {int(value) for value in str(row["days"]).split(",") if value.strip().isdigit()}:
+                    continue
+                scheduled = datetime.combine(day, datetime.strptime(row["time_of_day"], "%H:%M").time())
+                if start < scheduled <= end:
+                    slots.setdefault(scheduled, {"blocks": [], "events": []})["events"].append(int(row["id"]))
+            day += timedelta(days=1)
+        return slots
+
+    def _record_unplayed_occurrence(
+        self, origin_type: str, source_id: int, scheduled: datetime,
+        decision: str, reason: str, now: datetime,
+    ) -> int | None:
+        """Persist an ignored/missed occurrence without selecting or advancing media rotations."""
+        stamp = scheduled.strftime("%Y-%m-%d %H:%M")
+        ended_at = now.strftime("%Y-%m-%d %H:%M:%S")
+        delay_ms = max(0, int((now - scheduled).total_seconds() * 1000))
+        status = "missed" if decision == "missed" else "ignored"
+        with self.db.connect() as con:
+            if origin_type == "block":
+                source = con.execute("SELECT * FROM program_blocks WHERE id=?", (source_id,)).fetchone()
+                if not source:
+                    return None
+                item_rows = con.execute(
+                    "SELECT i.*,f.name AS folder_name,m.title AS media_title,m.artist,m.path,m.category,m.id AS actual_media_id,m.duration "
+                    "FROM program_block_items i LEFT JOIN media_folders f ON f.id=i.folder_id "
+                    "LEFT JOIN media m ON m.id=i.media_id WHERE i.block_id=? ORDER BY i.position,i.id",
+                    (source_id,),
+                ).fetchall()
+                if not item_rows:
+                    return None
+                con.execute(
+                    "INSERT OR IGNORE INTO program_occurrences(origin_type,block_id,scheduled_for,status,transition_policy,fixed_fade_ms,dispatch_delay_ms,dispatch_reason) "
+                    "VALUES('block',?,?,'planned',?,?,?,?)",
+                    (source_id, stamp, source["transition_policy"], source["fixed_fade_ms"], delay_ms, reason),
+                )
+                occurrence = con.execute(
+                    "SELECT id,status FROM program_occurrences WHERE block_id=? AND scheduled_for=?",
+                    (source_id, stamp),
+                ).fetchone()
+            else:
+                source = con.execute(
+                    "SELECT t.*,m.id AS actual_media_id,m.title AS media_title,m.artist,m.path,m.category AS media_category,m.duration "
+                    "FROM timeline_events t LEFT JOIN media m ON m.id=t.media_id WHERE t.id=?",
+                    (source_id,),
+                ).fetchone()
+                if not source:
+                    return None
+                item_rows = [source]
+                con.execute(
+                    "INSERT OR IGNORE INTO program_occurrences(origin_type,timeline_event_id,scheduled_for,status,dispatch_delay_ms,dispatch_reason) "
+                    "VALUES('timeline',?,?,'planned',?,?)",
+                    (source_id, stamp, delay_ms, reason),
+                )
+                occurrence = con.execute(
+                    "SELECT id,status FROM program_occurrences WHERE timeline_event_id=? AND scheduled_for=?",
+                    (source_id, stamp),
+                ).fetchone()
+            if not occurrence:
+                return None
+            occurrence_id = int(occurrence["id"])
+            existing_items = con.execute(
+                "SELECT 1 FROM program_occurrence_items WHERE occurrence_id=? LIMIT 1", (occurrence_id,),
+            ).fetchone()
+            if occurrence["status"] == "planned" and not existing_items:
+                for item in item_rows:
+                    if origin_type == "block":
+                        is_folder = item["folder_id"] is not None and str(item["selection_mode"] or "") in {"sequential", "random", "jingle_rotation"}
+                        title = str(item["folder_name"] or item["label"] or "Pasta") if is_folder else str(item["media_title"] or item["label"] or "Material indisponível")
+                        media_id = None if is_folder else item["actual_media_id"]
+                        artist = "" if is_folder else str(item["artist"] or "")
+                        path = "" if is_folder else str(item["path"] or "")
+                        category = str(item["category"] or source["block_type"])
+                        item_kind = "folder_selection" if is_folder else str(item["item_kind"] or "media")
+                        values = (
+                            occurrence_id, item["id"], media_id, item["position"], item_kind, title,
+                            artist, path, category, item["duration"] or 0, item["folder_id"],
+                            item["selection_mode"] or "", "ignored", ended_at, reason,
+                        )
+                        con.execute(
+                            "INSERT INTO program_occurrence_items(occurrence_id,source_item_id,media_id,position,item_kind,title,artist,path,category,duration,selection_folder_id,selection_mode,status,ended_at,error_message) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            values,
+                        )
+                    else:
+                        values = (
+                            occurrence_id, source["actual_media_id"], 0, "media",
+                            str(source["media_title"] or source["title"]), str(source["artist"] or ""),
+                            str(source["path"] or ""), str(source["media_category"] or source["category"]),
+                            source["duration"] or 0, "ignored", ended_at, reason,
+                        )
+                        con.execute(
+                            "INSERT INTO program_occurrence_items(occurrence_id,media_id,position,item_kind,title,artist,path,category,duration,status,ended_at,error_message) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                            values,
+                        )
+            con.execute(
+                "UPDATE program_occurrence_items SET status='ignored',ended_at=?,error_message=? "
+                "WHERE occurrence_id=? AND status='planned'",
+                (ended_at, reason, occurrence_id),
+            )
+            con.execute(
+                "UPDATE program_occurrences SET status=?,dispatch_delay_ms=?,dispatch_reason=? "
+                "WHERE id=? AND status IN ('planned','delayed','interrupted')",
+                (status, delay_ms, reason, occurrence_id),
+            )
+            if origin_type == "timeline":
+                con.execute("UPDATE timeline_events SET last_fired=? WHERE id=?", (stamp, source_id))
+            con.execute(
+                "INSERT OR IGNORE INTO scheduler_decisions(origin_type,source_id,scheduled_for,decision,reason) VALUES(?,?,?,?,?)",
+                (origin_type, source_id, stamp, decision, reason),
+            )
+            return occurrence_id
+
+    def _expire_unstarted_occurrences(
+        self, now: datetime, grace_seconds: int, preserve_item_id: int | None,
+    ) -> dict[str, list[int]]:
+        cutoff = (now - timedelta(seconds=grace_seconds)).strftime("%Y-%m-%d %H:%M:%S.%f")
+        fixed_cutoff = (now - timedelta(milliseconds=FIXED_LATE_GRACE_MS)).strftime("%Y-%m-%d %H:%M:%S.%f")
+        rows = self.db.all(
+            "SELECT o.id,o.origin_type,o.block_id,o.timeline_event_id,o.scheduled_for,o.transition_policy "
+            "FROM program_occurrences o WHERE o.status IN ('planned','delayed','interrupted','running') "
+            "AND ((o.transition_policy='fixed' AND o.scheduled_for||':00.000000'<?) "
+            "OR (o.transition_policy<>'fixed' AND o.scheduled_for||':00.000000'<?)) "
+            "AND EXISTS(SELECT 1 FROM program_occurrence_items i "
+            "WHERE i.occurrence_id=o.id AND i.status='planned') ORDER BY o.scheduled_for,o.id",
+            (fixed_cutoff, cutoff),
+        )
+        expired = {"missed_ids": [], "ignored_ids": []}
+        ended_at = now.strftime("%Y-%m-%d %H:%M:%S")
+        for row in rows:
+            occurrence_id = int(row["id"])
+            grace_ms = FIXED_LATE_GRACE_MS if row["transition_policy"] == "fixed" else grace_seconds * 1000
+            reason = f"Pendente expirado após janela de atraso de {grace_ms} ms; não foi reproduzido automaticamente."
+            with self.db.connect() as con:
+                con.execute(
+                    "UPDATE program_occurrence_items SET status='ignored',ended_at=?,error_message=? "
+                    "WHERE occurrence_id=? AND status='planned' AND (? IS NULL OR id<>?)",
+                    (ended_at, reason, occurrence_id, preserve_item_id, preserve_item_id),
+                )
+                active = con.execute(
+                    "SELECT 1 FROM program_occurrence_items WHERE occurrence_id=? AND status IN ('loading','playing','paused') LIMIT 1",
+                    (occurrence_id,),
+                ).fetchone()
+                if not active:
+                    con.execute(
+                        "UPDATE program_occurrences SET status='missed',dispatch_reason=? WHERE id=?",
+                        (reason, occurrence_id),
+                    )
+                con.execute(
+                    "INSERT OR IGNORE INTO scheduler_decisions(origin_type,source_id,scheduled_for,decision,reason) VALUES(?,?,?,?,?)",
+                    (str(row["origin_type"]), int(row["block_id"] or row["timeline_event_id"] or 0),
+                     str(row["scheduled_for"]), "missed" if not active else "expired_pending", reason),
+                )
+            expired["missed_ids" if not active else "ignored_ids"].append(occurrence_id)
+        return expired
+
+    def dispatch_window(
+        self, now: datetime, preserve_item_id: int | None = None,
+        force_recovery: bool = False,
+    ) -> dict[str, list[int] | bool]:
+        """Reconcile crossed clock slots without replaying stale insertions."""
+        cursor_key = "scheduler_last_checked_at"
+        cursor_text = self.db.setting(cursor_key, "")
+        invalid_cursor = False
+        if cursor_text:
+            try:
+                cursor = datetime.fromisoformat(cursor_text)
+            except ValueError:
+                invalid_cursor = True
+                cursor = now.replace(second=0, microsecond=0) - timedelta(microseconds=1)
+                reason = "Marco persistido do agendador inválido; recuperação limitada ao horizonte configurado."
+                self._record_scheduler_decision(
+                    "scheduler", 0, cursor_text[:16], "invalid_cursor", reason,
+                )
+        else:
+            # The first run considers only the current minute. This lets the
+            # scheduler audit a slot already missed at startup without replaying
+            # earlier minutes from before the application was running.
+            cursor = now.replace(second=0, microsecond=0) - timedelta(microseconds=1)
+        if now < cursor:
+            reason = f"Relógio do sistema retrocedeu; despacho pausado até alcançar o último marco ({cursor.isoformat()})."
+            self._record_scheduler_decision("scheduler", 0, cursor.strftime("%Y-%m-%d %H:%M"), "clock_rollback", reason)
+            return {"dispatch_ids": [], "missed_ids": [], "ignored_ids": [], "clock_rollback": True}
+
+        recovery_horizon = now - timedelta(days=SCHEDULER_RECOVERY_HORIZON_DAYS)
+        if cursor < recovery_horizon:
+            reason = (
+                f"Lacuna de agendamento superior a {SCHEDULER_RECOVERY_HORIZON_DAYS} dias; "
+                "eventos mais antigos não foram reconstruídos nem reproduzidos."
+            )
+            self._record_scheduler_decision(
+                "scheduler", 0, cursor.strftime("%Y-%m-%d %H:%M"), "recovery_horizon", reason,
+            )
+            cursor = recovery_horizon
+
+        gap_seconds = max(0.0, (now - cursor).total_seconds())
+        expired = {"missed_ids": [], "ignored_ids": []}
+        if force_recovery or gap_seconds > SCHEDULER_LATE_GRACE_SECONDS:
+            expired = self._expire_unstarted_occurrences(
+                now, SCHEDULER_LATE_GRACE_SECONDS, preserve_item_id,
+            )
+
+        dispatch_ids: list[int] = []
+        missed_ids: list[int] = list(expired["missed_ids"])
+        ignored_ids: list[int] = list(expired["ignored_ids"])
+        scan_start = min(cursor, now - timedelta(seconds=SCHEDULER_LATE_GRACE_SECONDS))
+        slots = self._slot_candidates(scan_start, now)
+        for scheduled in sorted(slots):
+            candidate = slots[scheduled]
+            block_ids = candidate["blocks"]
+            event_ids = candidate["events"]
+            stamp = scheduled.strftime("%Y-%m-%d %H:%M")
+            existing_rows = self.db.all(
+                "SELECT block_id,timeline_event_id,status FROM program_occurrences WHERE scheduled_for=?",
+                (stamp,),
+            )
+            existing_sources = {
+                ("block", int(row["block_id"])) for row in existing_rows if row["block_id"] is not None
+            } | {
+                ("timeline", int(row["timeline_event_id"])) for row in existing_rows if row["timeline_event_id"] is not None
+            }
+            existing_active = any(row["status"] in {"running", "loading", "playing", "paused"} for row in existing_rows)
+            fixed_blocks = [
+                int(row["id"]) for row in self.db.all(
+                    f"SELECT id FROM program_blocks WHERE id IN ({','.join('?' for _ in block_ids)}) "
+                    "AND block_type='Comercial' AND transition_policy='fixed' ORDER BY id",
+                    tuple(block_ids),
+                )
+            ] if block_ids else []
+            age_ms = max(0, int((now - scheduled).total_seconds() * 1000))
+            fixed_winner = min(fixed_blocks) if fixed_blocks else None
+            is_missed = age_ms > SCHEDULER_LATE_GRACE_SECONDS * 1000
+            if fixed_winner is not None and age_ms > FIXED_LATE_GRACE_MS:
+                is_missed = True
+
+            if fixed_winner is not None:
+                winners = {fixed_winner}
+                conflicts = [("block", value) for value in block_ids if value != fixed_winner]
+                conflicts.extend(("timeline", value) for value in event_ids)
+                conflict_reason = f"Ignorado por conflito no mesmo horário; o bloco Fixo {fixed_winner} tem prioridade determinística."
+            else:
+                winners = set(block_ids)
+                conflicts = []
+                conflict_reason = ""
+
+            for origin_type, source_id in conflicts:
+                occurrence_id = self._record_unplayed_occurrence(
+                    origin_type, source_id, scheduled, "ignored", conflict_reason, now,
+                )
+                if occurrence_id is not None:
+                    ignored_ids.append(occurrence_id)
+
+            if fixed_winner is not None and existing_active and ("block", fixed_winner) not in existing_sources:
+                reason = "Bloco Fixo ignorado: outra ocorrência do mesmo horário já iniciou; não se aplica corte retroativo."
+                occurrence_id = self._record_unplayed_occurrence("block", fixed_winner, scheduled, "ignored", reason, now)
+                if occurrence_id is not None:
+                    ignored_ids.append(occurrence_id)
+                continue
+            if fixed_winner is not None and ("block", fixed_winner) in existing_sources:
+                continue
+
+            if is_missed:
+                reason = (
+                    f"Evento perdido: atraso de {age_ms} ms excede a janela aceita; "
+                    "não será executado automaticamente."
+                )
+                for source_id in sorted(winners):
+                    occurrence_id = self._record_unplayed_occurrence("block", source_id, scheduled, "missed", reason, now)
+                    if occurrence_id is not None:
+                        missed_ids.append(occurrence_id)
+                if not fixed_winner:
+                    for source_id in sorted(event_ids):
+                        occurrence_id = self._record_unplayed_occurrence("timeline", source_id, scheduled, "missed", reason, now)
+                        if occurrence_id is not None:
+                            missed_ids.append(occurrence_id)
+                continue
+
+            allowed_blocks = winners if fixed_winner is not None else {
+                source_id for source_id in block_ids if ("block", source_id) not in existing_sources
+            }
+            allowed_events = set() if fixed_winner is not None else {
+                source_id for source_id in event_ids if ("timeline", source_id) not in existing_sources
+            }
+            if fixed_winner is None and not allowed_blocks and not allowed_events:
+                continue
+            self.due(scheduled, allowed_blocks, allowed_events)
+            rows = self.db.all(
+                "SELECT id,origin_type,block_id,timeline_event_id,status FROM program_occurrences WHERE scheduled_for=? ORDER BY id",
+                (stamp,),
+            )
+            source_keys = {
+                ("block", value) for value in allowed_blocks
+            } | {
+                ("timeline", value) for value in allowed_events
+            }
+            reason = (
+                f"Despachado com atraso de {age_ms} ms dentro da janela de {FIXED_LATE_GRACE_MS} ms do Fixo."
+                if fixed_winner is not None and age_ms > 0 else
+                f"Despachado com atraso de {age_ms} ms dentro da janela de {SCHEDULER_LATE_GRACE_SECONDS}s."
+                if age_ms > 0 else "Despachado no horário programado."
+            )
+            for row in rows:
+                source_key = (str(row["origin_type"]), int(row["block_id"] or row["timeline_event_id"] or 0))
+                if source_key not in source_keys or row["status"] not in {"planned", "delayed", "running", "interrupted"}:
+                    continue
+                occurrence_id = int(row["id"])
+                self.db.execute(
+                    "UPDATE program_occurrences SET status=CASE WHEN ? > 0 AND status='planned' THEN 'delayed' ELSE status END,dispatch_delay_ms=?,dispatch_reason=? WHERE id=?",
+                    (age_ms, age_ms, reason, occurrence_id),
+                )
+                decision = "delayed" if age_ms else "scheduled"
+                source_id = source_key[1]
+                self._record_scheduler_decision(source_key[0], source_id, stamp, decision, reason)
+                dispatch_ids.append(occurrence_id)
+
+        if force_recovery:
+            pending = self.db.all(
+                "SELECT o.id,o.origin_type,o.block_id,o.timeline_event_id,o.scheduled_for,o.status,o.transition_policy "
+                "FROM program_occurrences o WHERE o.status IN ('planned','delayed','running','interrupted') "
+                "AND EXISTS(SELECT 1 FROM program_occurrence_items i WHERE i.occurrence_id=o.id AND i.status='planned') "
+                "ORDER BY o.scheduled_for,CASE WHEN o.origin_type='block' THEN 0 ELSE 1 END,COALESCE(o.block_id,o.timeline_event_id),o.id"
+            )
+            for row in pending:
+                occurrence_id = int(row["id"])
+                if occurrence_id in dispatch_ids:
+                    continue
+                scheduled = datetime.strptime(row["scheduled_for"], "%Y-%m-%d %H:%M")
+                delay_ms = max(0, int((now - scheduled).total_seconds() * 1000))
+                grace_ms = FIXED_LATE_GRACE_MS if row["transition_policy"] == "fixed" else SCHEDULER_LATE_GRACE_SECONDS * 1000
+                if delay_ms > grace_ms:
+                    continue
+                reason = f"Ocorrência pendente retomada após reinicialização com atraso de {delay_ms} ms."
+                if delay_ms > 0 and row["status"] == "planned":
+                    self.db.execute(
+                        "UPDATE program_occurrences SET status='delayed',dispatch_delay_ms=?,dispatch_reason=? WHERE id=?",
+                        (delay_ms, reason, occurrence_id),
+                    )
+                self._record_scheduler_decision(
+                    str(row["origin_type"]), int(row["block_id"] or row["timeline_event_id"] or 0),
+                    str(row["scheduled_for"]), "resumed_pending", reason,
+                )
+                dispatch_ids.append(occurrence_id)
+
+        # Save the high-water mark only after decisions are durable. Unique occurrence
+        # indexes and scheduler_decisions make a retry safe after an interrupted write.
+        current_cursor = now.replace(microsecond=0).isoformat()
+        with self.db.connect() as con:
+            if invalid_cursor:
+                con.execute(
+                    "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (cursor_key, current_cursor),
+                )
+            else:
+                con.execute(
+                    "INSERT INTO settings(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=CASE WHEN excluded.value>settings.value THEN excluded.value ELSE settings.value END",
+                    (cursor_key, current_cursor),
+                )
+        return {
+            "dispatch_ids": dispatch_ids,
+            "missed_ids": missed_ids,
+            "ignored_ids": ignored_ids,
+            "clock_rollback": False,
+        }
+
     def next_occurrence_item(self):
         return self.db.one(
-            "SELECT i.*,o.scheduled_for,o.id AS occurrence_id FROM program_occurrence_items i JOIN program_occurrences o ON o.id=i.occurrence_id WHERE i.status='planned' AND o.status IN ('planned','running','interrupted') ORDER BY CASE o.status WHEN 'planned' THEN 0 WHEN 'running' THEN 1 ELSE 2 END,o.scheduled_for,o.id,i.position,i.id LIMIT 1"
+            "SELECT i.*,o.scheduled_for,o.id AS occurrence_id FROM program_occurrence_items i "
+            "JOIN program_occurrences o ON o.id=i.occurrence_id WHERE i.status='planned' "
+            "AND o.status IN ('planned','delayed','running','interrupted') "
+            "ORDER BY o.scheduled_for,CASE WHEN o.origin_type='block' THEN 0 ELSE 1 END,"
+            "COALESCE(o.block_id,o.timeline_event_id),o.id,i.position,i.id LIMIT 1"
         )
 
     def set_occurrence_item_status(self, item_id: int, status: str, error_message: str = "") -> None:
-        allowed = {"planned", "loading", "playing", "paused", "completed", "skipped", "discarded", "stopped", "failed", "ejected", "interrupted"}
+        allowed = {"planned", "loading", "playing", "paused", "completed", "skipped", "discarded", "ignored", "stopped", "failed", "ejected", "interrupted"}
         if status not in allowed:
             raise ValueError(f"Estado de ocorrência inválido: {status}")
         with self.db.connect() as con:
             con.execute(
-                "UPDATE program_occurrence_items SET status=?,error_message=?,started_at=CASE WHEN ?='playing' AND started_at='' THEN CURRENT_TIMESTAMP ELSE started_at END,ended_at=CASE WHEN ? IN ('completed','skipped','discarded','stopped','failed','interrupted') THEN CURRENT_TIMESTAMP ELSE ended_at END WHERE id=?",
+                "UPDATE program_occurrence_items SET status=?,error_message=?,started_at=CASE WHEN ?='playing' AND started_at='' THEN CURRENT_TIMESTAMP ELSE started_at END,ended_at=CASE WHEN ? IN ('completed','skipped','discarded','ignored','stopped','failed','interrupted') THEN CURRENT_TIMESTAMP ELSE ended_at END WHERE id=?",
                 (status, error_message, status, status, item_id),
             )
             occurrence_id = con.execute("SELECT occurrence_id FROM program_occurrence_items WHERE id=?", (item_id,)).fetchone()
@@ -646,7 +1059,7 @@ class ProgrammingService:
                 if status == "interrupted":
                     con.execute("UPDATE program_occurrences SET status='interrupted' WHERE id=?", (occurrence_id["occurrence_id"],))
                     return
-                pending = con.execute("SELECT 1 FROM program_occurrence_items WHERE occurrence_id=? AND status NOT IN ('completed','skipped','discarded','stopped','failed','interrupted') LIMIT 1", (occurrence_id["occurrence_id"],)).fetchone()
+                pending = con.execute("SELECT 1 FROM program_occurrence_items WHERE occurrence_id=? AND status NOT IN ('completed','skipped','discarded','ignored','stopped','failed','interrupted') LIMIT 1", (occurrence_id["occurrence_id"],)).fetchone()
                 if pending:
                     con.execute("UPDATE program_occurrences SET status='running' WHERE id=?", (occurrence_id["occurrence_id"],))
                 else:

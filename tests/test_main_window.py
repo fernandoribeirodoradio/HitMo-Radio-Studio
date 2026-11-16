@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 import wave
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -97,6 +97,9 @@ class MainWindowIntegrationTests(unittest.TestCase):
             scheduled_path = self._write_test_audio(Path(temp) / "scheduled.wav", 0.25)
             window = MainWindow()
             try:
+                # The scheduling clock is injected below; stop its wall-clock
+                # timer so the test does not simulate a day-long clock jump.
+                window._timer.stop()
                 window.db.set_setting("auto_advance", "0")
                 window.library.import_paths([current_path], category=current_category)
                 window.library.import_paths([scheduled_path], category="Música")
@@ -133,6 +136,10 @@ class MainWindowIntegrationTests(unittest.TestCase):
                     def now(cls):
                         return datetime(2026, 11, 15, 12, 30, 15)
 
+                # MainWindow's 500 ms timer can tick before this controlled-clock
+                # assertion; seed its persistent cursor to the same test timeline.
+                window.db.set_setting("scheduler_last_checked_at", "2026-11-15T12:29:59")
+                window._scheduler_first_tick = False
                 with patch("hitmo.main_window.datetime", ControlledClock), patch.object(
                     window.engine, "stop_program", wraps=window.engine.stop_program
                 ) as stop_program:
@@ -173,6 +180,80 @@ class MainWindowIntegrationTests(unittest.TestCase):
 
     def test_new_scheduled_block_waits_for_current_commercial_to_finish(self):
         self._scheduled_transition_does_not_cut_current_item("Comercial")
+
+    def test_missed_schedule_does_not_interrupt_current_pgm(self):
+        if not QMediaDevices.audioOutputs():
+            self.skipTest("Nenhuma saída de áudio disponível para executar o WAV de teste.")
+        previous_data_dir = os.environ.get("HITMO_DATA_DIR")
+        with tempfile.TemporaryDirectory() as temp:
+            os.environ["HITMO_DATA_DIR"] = temp
+            current_path = self._write_test_audio(Path(temp) / "current-missed.wav", 4.0)
+            scheduled_path = self._write_test_audio(Path(temp) / "scheduled-missed.wav", 0.25)
+            window = MainWindow()
+            try:
+                window._timer.stop()
+                window.db.set_setting("auto_advance", "0")
+                window.library.import_paths([current_path], category="Música")
+                window.library.import_paths([scheduled_path], category="Música")
+                current = window.db.one("SELECT * FROM media WHERE path=?", (str(current_path.resolve()),))
+                scheduled = window.db.one("SELECT * FROM media WHERE path=?", (str(scheduled_path.resolve()),))
+                block_id = window.programming.add_block("Atrasado", "Música", "12:00", [6])
+                window.programming.add_block_item(block_id, int(scheduled["id"]))
+                window.db.set_setting("scheduler_last_checked_at", "2026-11-15T11:59:59")
+                window._scheduler_first_tick = False
+                self.assertTrue(window._play_media(current, source_type="manual"))
+                self.assertTrue(self._wait_until(lambda: window.engine.program.position() > 0))
+                with patch.object(window.engine, "stop_program", wraps=window.engine.stop_program) as stop_program:
+                    window._tick(datetime(2026, 11, 15, 12, 1, 0))
+                self.assertEqual(stop_program.call_count, 0)
+                self.assertEqual(window._current["title"], "current-missed")
+                self.assertEqual(window.engine.program.playbackState(), QMediaPlayer.PlaybackState.PlayingState)
+                occurrence = window.db.one("SELECT status FROM program_occurrences WHERE block_id=?", (block_id,))
+                item = window.db.one("SELECT status,error_message FROM program_occurrence_items WHERE occurrence_id=(SELECT id FROM program_occurrences WHERE block_id=?)", (block_id,))
+                self.assertEqual(occurrence["status"], "missed")
+                self.assertEqual(item["status"], "ignored")
+                self.assertIn("perdido", item["error_message"])
+            finally:
+                window.engine.stop_program()
+                window.engine.eject_program()
+                self._wait_until(lambda: window.engine.program.mediaStatus() == QMediaPlayer.MediaStatus.NoMedia, 2000)
+                window.close()
+                window.deleteLater()
+                self.app.processEvents()
+        if previous_data_dir is None:
+            os.environ.pop("HITMO_DATA_DIR", None)
+        else:
+            os.environ["HITMO_DATA_DIR"] = previous_data_dir
+
+    def test_clock_rollback_does_not_arm_a_fixed_cut_before_high_water_mark(self):
+        previous_data_dir = os.environ.get("HITMO_DATA_DIR")
+        with tempfile.TemporaryDirectory() as temp:
+            os.environ["HITMO_DATA_DIR"] = temp
+            audio_path = self._write_test_audio(Path(temp) / "fixed-rollback.wav", 1.0)
+            window = MainWindow()
+            try:
+                window._timer.stop()
+                window.library.import_paths([audio_path], category="Comercial")
+                media_id = int(window.db.one("SELECT id FROM media")["id"])
+                block_id = window.programming.add_block(
+                    "Fixo futuro", "Comercial", "12:30", [6], transition_policy="fixed",
+                )
+                window.programming.add_block_item(block_id, media_id)
+                window.db.set_setting("scheduler_last_checked_at", "2026-11-15T12:05:00")
+
+                window._schedule_fixed_transition(datetime(2026, 11, 15, 12, 0, 0))
+
+                self.assertIsNone(window._fixed_transition_target)
+                self.assertFalse(window._fixed_transition_timer.isActive())
+                self.assertFalse(window.engine.program_fade_active)
+            finally:
+                window.close()
+                window.deleteLater()
+                self.app.processEvents()
+        if previous_data_dir is None:
+            os.environ.pop("HITMO_DATA_DIR", None)
+        else:
+            os.environ["HITMO_DATA_DIR"] = previous_data_dir
 
     def test_fixed_transition_fades_current_program_and_records_interruption_reason(self):
         if not QMediaDevices.audioOutputs():
@@ -295,9 +376,11 @@ class MainWindowIntegrationTests(unittest.TestCase):
             self.assertGreaterEqual(float(history[0]["played_seconds"]), 0)
 
             now = datetime.now()
+            scheduled_at = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
             media_id = int(media["id"])
-            window.timeline.add(now.strftime("%H:%M"), [now.weekday()], "Evento A", media_id, "Comercial")
-            window.timeline.add(now.strftime("%H:%M"), [now.weekday()], "Evento B", media_id, "Música")
+            window._timer.stop()
+            window.timeline.add(scheduled_at.strftime("%H:%M"), [scheduled_at.weekday()], "Evento A", media_id, "Comercial")
+            window.timeline.add(scheduled_at.strftime("%H:%M"), [scheduled_at.weekday()], "Evento B", media_id, "Música")
             sequence = QEventLoop()
             completed = []
 
@@ -308,7 +391,7 @@ class MainWindowIntegrationTests(unittest.TestCase):
 
             window.engine.program_finished.connect(on_finished)
             QTimer.singleShot(4000, sequence.quit)
-            window._tick()
+            window._tick(scheduled_at)
             self.assertEqual(int(window.db.one("SELECT COUNT(*) AS n FROM program_occurrence_items WHERE status='planned'")["n"]), 1)
             sequence.exec()
             self.assertEqual(len(completed), 2, "Os eventos da timeline não foram reproduzidos em sequência.")

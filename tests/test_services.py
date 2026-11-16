@@ -196,6 +196,193 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.programming.due(datetime(2026, 11, 15, 12, 30)), [])
         self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM program_occurrences")["n"], 0)
 
+    def test_scheduler_dispatches_within_grace_once_and_records_delay(self):
+        audio = make_wav(self.root / "scheduler-late.wav")
+        self.library.import_paths([audio], category="Música")
+        media_id = int(self.db.one("SELECT id FROM media") ["id"])
+        block_id = self.programming.add_block("Atraso tolerado", "Música", "12:00", [6])
+        self.programming.add_block_item(block_id, media_id)
+
+        result = self.programming.dispatch_window(datetime(2026, 11, 15, 12, 0, 20))
+        self.assertEqual(len(result["dispatch_ids"]), 1)
+        self.assertEqual(result["missed_ids"], [])
+        occurrence = self.db.one("SELECT status,dispatch_delay_ms,dispatch_reason FROM program_occurrences")
+        self.assertEqual((occurrence["status"], occurrence["dispatch_delay_ms"]), ("delayed", 20000))
+        self.assertIn("janela", occurrence["dispatch_reason"])
+        self.assertEqual(len(self.programming.dispatch_window(datetime(2026, 11, 15, 12, 0, 20))["dispatch_ids"]), 0)
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM program_occurrences")["n"], 1)
+
+    def test_scheduler_marks_old_slot_missed_without_selecting_or_advancing_rotation(self):
+        folder_id, _media_ids = self._music_folder_with_tracks(["Alpha", "Bravo"])
+        block_id = self.programming.add_block("Atrasado", "Música", "12:00", [6])
+        self.programming.add_block_folder(block_id, folder_id, "random")
+
+        result = self.programming.dispatch_window(datetime(2026, 11, 15, 12, 0, 31))
+        self.assertEqual(result["dispatch_ids"], [])
+        self.assertEqual(len(result["missed_ids"]), 1)
+        occurrence = self.db.one("SELECT status,dispatch_delay_ms,dispatch_reason FROM program_occurrences")
+        item = self.db.one("SELECT status,selected_at,error_message,media_id FROM program_occurrence_items")
+        self.assertEqual(occurrence["status"], "missed")
+        self.assertEqual(occurrence["dispatch_delay_ms"], 31000)
+        self.assertEqual(item["status"], "ignored")
+        self.assertEqual(item["selected_at"], "")
+        self.assertIsNone(item["media_id"])
+        self.assertIn("perdido", item["error_message"])
+        self.assertEqual(self.programming.next_occurrence_item(), None)
+        self.assertEqual(self.db.one("SELECT decision FROM scheduler_decisions")["decision"], "missed")
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM folder_rotation_state WHERE folder_id=?", (folder_id,))["n"], 0)
+
+    def test_scheduler_first_start_audits_current_minute_without_replaying_earlier_slots(self):
+        files = [make_wav(self.root / f"startup-{index}.wav") for index in range(2)]
+        self.library.import_paths(files, category="Música")
+        media_ids = [int(row["id"]) for row in self.db.all("SELECT id FROM media ORDER BY id")]
+        earlier_block = self.programming.add_block("Horário anterior", "Música", "11:59", [6])
+        current_block = self.programming.add_block("Horário vencido", "Música", "12:00", [6])
+        self.programming.add_block_item(earlier_block, media_ids[0])
+        self.programming.add_block_item(current_block, media_ids[1])
+
+        result = self.programming.dispatch_window(datetime(2026, 11, 15, 12, 0, 45))
+
+        self.assertEqual(len(result["missed_ids"]), 1)
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM program_occurrences")["n"], 1)
+        occurrence = self.db.one("SELECT block_id,status,dispatch_delay_ms FROM program_occurrences")
+        self.assertEqual((occurrence["block_id"], occurrence["status"], occurrence["dispatch_delay_ms"]),
+                         (current_block, "missed", 45000))
+        self.assertEqual(self.db.one("SELECT block_id FROM program_occurrences")["block_id"], current_block)
+
+    def test_scheduler_marks_missed_timeline_event_and_sets_its_daily_marker(self):
+        audio = make_wav(self.root / "timeline-missed.wav")
+        self.library.import_paths([audio], category="Comercial")
+        media_id = int(self.db.one("SELECT id FROM media")["id"])
+        event_id = self.timeline.add("12:00", [6], "Comercial atrasado", media_id, "Comercial")
+        self.db.set_setting("scheduler_last_checked_at", "2026-11-15T11:59:59")
+
+        result = self.programming.dispatch_window(datetime(2026, 11, 15, 12, 1, 0))
+        occurrence = self.db.one("SELECT status,dispatch_delay_ms FROM program_occurrences WHERE timeline_event_id=?", (event_id,))
+        item = self.db.one(
+            "SELECT status,error_message FROM program_occurrence_items WHERE occurrence_id=(SELECT id FROM program_occurrences WHERE timeline_event_id=?)",
+            (event_id,),
+        )
+        event = self.db.one("SELECT last_fired FROM timeline_events WHERE id=?", (event_id,))
+        self.assertEqual(len(result["missed_ids"]), 1)
+        self.assertEqual((occurrence["status"], occurrence["dispatch_delay_ms"]), ("missed", 60000))
+        self.assertEqual(item["status"], "ignored")
+        self.assertIn("não será executado", item["error_message"])
+        self.assertEqual(event["last_fired"], "2026-11-15 12:00")
+
+    def test_scheduler_recovery_expires_old_pending_without_touching_current_occurrence(self):
+        files = [make_wav(self.root / f"resume-{index}.wav") for index in range(3)]
+        self.library.import_paths(files, category="Música")
+        media_ids = [int(row["id"]) for row in self.db.all("SELECT id FROM media ORDER BY id")]
+        old_block = self.programming.add_block("Pendente antigo", "Música", "12:00", [6])
+        for media_id in media_ids[:2]:
+            self.programming.add_block_item(old_block, media_id)
+        old_occurrence = self.programming.due(datetime(2026, 11, 15, 12, 0))[0]
+        current_item = int(self.db.one("SELECT id FROM program_occurrence_items WHERE occurrence_id=? ORDER BY position LIMIT 1", (old_occurrence,))["id"])
+        self.programming.set_occurrence_item_status(current_item, "playing")
+        newer_block = self.programming.add_block("Novo bloco", "Música", "12:01", [6])
+        self.programming.add_block_item(newer_block, media_ids[2])
+        self.db.set_setting("scheduler_last_checked_at", "2026-11-15T12:00:00")
+
+        result = self.programming.dispatch_window(
+            datetime(2026, 11, 15, 12, 1, 0), preserve_item_id=current_item, force_recovery=True,
+        )
+        old_statuses = self.db.all("SELECT status FROM program_occurrence_items WHERE occurrence_id=? ORDER BY position", (old_occurrence,))
+        self.assertEqual([row["status"] for row in old_statuses], ["playing", "ignored"])
+        self.assertEqual(self.db.one("SELECT status FROM program_occurrences WHERE id=?", (old_occurrence,))["status"], "running")
+        self.assertEqual(len(result["dispatch_ids"]), 1)
+        self.assertEqual(self.db.one("SELECT title FROM program_occurrence_items WHERE occurrence_id=(SELECT id FROM program_occurrences WHERE block_id=?)", (newer_block,))["title"], "resume-2")
+
+    def test_scheduler_resumes_existing_recent_occurrence_after_restart_once(self):
+        audio = make_wav(self.root / "restart-pending.wav")
+        self.library.import_paths([audio], category="Música")
+        media_id = int(self.db.one("SELECT id FROM media")["id"])
+        block_id = self.programming.add_block("Pendente recente", "Música", "12:00", [6])
+        self.programming.add_block_item(block_id, media_id)
+        occurrence_id = self.programming.due(datetime(2026, 11, 15, 12, 0))[0]
+        self.db.set_setting("scheduler_last_checked_at", "2026-11-15T12:00:00")
+
+        result = self.programming.dispatch_window(datetime(2026, 11, 15, 12, 0, 20), force_recovery=True)
+
+        self.assertEqual(result["dispatch_ids"], [occurrence_id])
+        self.assertEqual(self.db.one("SELECT status FROM program_occurrences WHERE id=?", (occurrence_id,))["status"], "delayed")
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM program_occurrence_items WHERE occurrence_id=?", (occurrence_id,))["n"], 1)
+        self.assertEqual(self.db.one("SELECT decision FROM scheduler_decisions WHERE decision='resumed_pending'")["decision"], "resumed_pending")
+
+    def test_scheduler_does_not_resume_fixed_occurrence_past_its_exact_time_tolerance(self):
+        audio = make_wav(self.root / "fixed-restart.wav")
+        self.library.import_paths([audio], category="Comercial")
+        media_id = int(self.db.one("SELECT id FROM media")["id"])
+        block_id = self.programming.add_block("Fixo vencido", "Comercial", "12:00", [6], transition_policy="fixed")
+        self.programming.add_block_item(block_id, media_id)
+        occurrence_id = self.programming.due(datetime(2026, 11, 15, 12, 0))[0]
+        self.db.set_setting("scheduler_last_checked_at", "2026-11-15T12:00:00")
+
+        result = self.programming.dispatch_window(datetime(2026, 11, 15, 12, 0, 5), force_recovery=True)
+
+        self.assertEqual(result["dispatch_ids"], [])
+        self.assertEqual(self.db.one("SELECT status FROM program_occurrences WHERE id=?", (occurrence_id,))["status"], "missed")
+        self.assertEqual(self.db.one("SELECT status FROM program_occurrence_items WHERE occurrence_id=?", (occurrence_id,))["status"], "ignored")
+
+    def test_scheduler_fixed_conflict_has_deterministic_priority_and_clock_rollback_does_not_replay(self):
+        paths = [make_wav(self.root / f"priority-{index}.wav") for index in range(3)]
+        self.library.import_paths(paths, category="Comercial")
+        media_ids = [int(row["id"]) for row in self.db.all("SELECT id FROM media ORDER BY id")]
+        fixed_a = self.programming.add_block("Fixo A", "Comercial", "12:00", [6], transition_policy="fixed")
+        fixed_b = self.programming.add_block("Fixo B", "Comercial", "12:00", [6], transition_policy="fixed")
+        regular = self.programming.add_block("Comercial regular", "Comercial", "12:00", [6])
+        for block_id, media_id in zip((fixed_a, fixed_b, regular), media_ids):
+            self.programming.add_block_item(block_id, media_id)
+
+        result = self.programming.dispatch_window(datetime(2026, 11, 15, 12, 0, 0))
+        self.assertEqual(len(result["dispatch_ids"]), 1)
+        winner = self.db.one("SELECT id,block_id,status FROM program_occurrences WHERE block_id=?", (fixed_a,))
+        loser_rows = self.db.all("SELECT block_id,status FROM program_occurrences WHERE block_id IN (?,?) ORDER BY block_id", (fixed_b, regular))
+        self.assertEqual(winner["status"], "planned")
+        self.assertEqual([row["status"] for row in loser_rows], ["ignored", "ignored"])
+        self.assertIn("prioridade", self.db.one("SELECT dispatch_reason FROM program_occurrences WHERE block_id=?", (fixed_b,))["dispatch_reason"])
+
+        rollback = self.programming.dispatch_window(datetime(2026, 11, 15, 11, 59, 0))
+        self.assertTrue(rollback["clock_rollback"])
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM program_occurrences")["n"], 3)
+        self.assertEqual(self.db.one("SELECT decision FROM scheduler_decisions WHERE decision='clock_rollback'")["decision"], "clock_rollback")
+
+    def test_scheduler_same_minute_blocks_are_queued_by_block_id(self):
+        files = [make_wav(self.root / f"collision-{index}.wav") for index in range(2)]
+        self.library.import_paths(files, category="Música")
+        media_ids = [int(row["id"]) for row in self.db.all("SELECT id FROM media ORDER BY id")]
+        block_ids = []
+        for index, media_id in enumerate(media_ids):
+            block_id = self.programming.add_block(f"Colisão {index}", "Música", "12:00", [6])
+            self.programming.add_block_item(block_id, media_id)
+            block_ids.append(block_id)
+
+        result = self.programming.dispatch_window(datetime(2026, 11, 15, 12, 0, 0))
+        actual_blocks = [int(row["block_id"]) for row in self.db.all(
+            "SELECT block_id FROM program_occurrences WHERE id IN (?,?) ORDER BY id", tuple(result["dispatch_ids"]),
+        )]
+        first_pending = self.programming.next_occurrence_item()
+        self.assertEqual(actual_blocks, block_ids)
+        self.assertEqual(len(result["dispatch_ids"]), 2)
+        self.assertEqual(int(first_pending["occurrence_id"]), result["dispatch_ids"][0])
+
+    def test_scheduler_bounds_long_recovery_and_audits_older_range(self):
+        audio = make_wav(self.root / "horizon.wav")
+        self.library.import_paths([audio], category="Música")
+        media_id = int(self.db.one("SELECT id FROM media")["id"])
+        block_id = self.programming.add_block("Diário", "Música", "12:00", list(range(7)))
+        self.programming.add_block_item(block_id, media_id)
+        now = datetime(2026, 11, 15, 12, 0)
+        self.db.set_setting("scheduler_last_checked_at", "2026-10-01T12:00:00")
+
+        result = self.programming.dispatch_window(now)
+
+        self.assertEqual(len(result["missed_ids"]), 30)
+        self.assertEqual(len(result["dispatch_ids"]), 1)
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM program_occurrences")["n"], 31)
+        self.assertTrue(self.db.one("SELECT id FROM scheduler_decisions WHERE decision='recovery_horizon'"))
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM program_occurrence_items WHERE status='planned'")["n"], 1)
+
     def test_missing_file_is_snapshotted_as_pending_material(self):
         path = self.root / "offline" / "ausente.wav"
         media_id = self.db.execute("INSERT INTO media(path,title,category) VALUES(?,?,?)", (str(path), "Ausente", "Música"))

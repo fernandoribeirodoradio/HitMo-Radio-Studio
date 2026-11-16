@@ -6,7 +6,7 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, datetime as _SystemDateTime
 from pathlib import Path
 
 from PySide6.QtCore import QProcess, Qt, QTimer, QUrl
@@ -151,6 +151,7 @@ class MainWindow(QMainWindow):
         self._fixed_transition_fade_done = False
         self._fixed_transition_position_ms = None
         self._fixed_transition_late = False
+        self._scheduler_first_tick = True
         self.db.execute("UPDATE playback_history SET status='interrupted',ended_at=CURRENT_TIMESTAMP WHERE status IN ('loading','playing','paused')")
         self.playlist.recover_interrupted()
         self.programming.recover_interrupted()
@@ -1077,7 +1078,19 @@ class MainWindow(QMainWindow):
         target = self._fixed_transition_target
         if target is None or not self._current or self._fixed_transition_due:
             return
-        remaining_ms = int((target - datetime.now()).total_seconds() * 1000)
+        now = datetime.now()
+        cursor_text = self.db.setting("scheduler_last_checked_at", "")
+        try:
+            scheduler_cursor = _SystemDateTime.fromisoformat(cursor_text) if cursor_text else None
+        except ValueError:
+            scheduler_cursor = None
+        if scheduler_cursor is not None and now < scheduler_cursor:
+            self._fixed_transition_timer.stop()
+            self.engine.cancel_program_fade()
+            self._fixed_transition_target = None
+            self._fixed_transition_fade_done = False
+            return
+        remaining_ms = int((target - now).total_seconds() * 1000)
         if remaining_ms <= 0:
             self._fixed_transition_late = True
             self.engine.fade_out_program(0)
@@ -1225,6 +1238,19 @@ class MainWindow(QMainWindow):
         self._refresh_timeline()
 
     def _schedule_fixed_transition(self, now: datetime):
+        cursor_text = self.db.setting("scheduler_last_checked_at", "")
+        try:
+            scheduler_cursor = _SystemDateTime.fromisoformat(cursor_text) if cursor_text else None
+        except ValueError:
+            scheduler_cursor = None
+        if scheduler_cursor is not None and now < scheduler_cursor:
+            self._fixed_transition_timer.stop()
+            if self.engine.program_fade_active:
+                self.engine.cancel_program_fade()
+            self._fixed_transition_target = None
+            self._fixed_fade_timer_target = None
+            self._fixed_transition_fade_done = False
+            return
         upcoming = self.programming.next_fixed_transition(now)
         if upcoming is None:
             if (
@@ -1266,7 +1292,22 @@ class MainWindow(QMainWindow):
         now = now or datetime.now()
         self.clock_label.setText(now.strftime("%H:%M:%S"))
         self._schedule_fixed_transition(now)
-        due = self.programming.due(now)
+        dispatch = self.programming.dispatch_window(
+            now,
+            preserve_item_id=self._current_occurrence_item_id,
+            force_recovery=self._scheduler_first_tick,
+        )
+        self._scheduler_first_tick = False
+        due = dispatch["dispatch_ids"]
+        if dispatch["clock_rollback"]:
+            self.statusBar().showMessage("Relógio retrocedeu · despacho pausado para evitar duplicidade", 8000)
+            return
+        if dispatch["missed_ids"] or dispatch["ignored_ids"]:
+            self.statusBar().showMessage(
+                f"Reconciliação do agendamento · {len(dispatch['missed_ids'])} ocorrência(s) perdida(s) · "
+                f"{len(dispatch['ignored_ids'])} ignorada(s) · áudio atual preservado",
+                8000,
+            )
         if due:
             pending_items = self.db.one(
                 "SELECT COUNT(*) AS n FROM program_occurrence_items WHERE status='planned'"
@@ -1303,6 +1344,9 @@ class MainWindow(QMainWindow):
             # source only when no item is active. Natural end/error advances it.
             if not self._current:
                 self._play_next_pending()
+            self._refresh_timeline()
+            self._refresh_program_blocks()
+        elif dispatch["missed_ids"] or dispatch["ignored_ids"]:
             self._refresh_timeline()
             self._refresh_program_blocks()
 

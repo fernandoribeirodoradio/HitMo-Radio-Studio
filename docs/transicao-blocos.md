@@ -20,7 +20,7 @@ O material interrompido por `Fixo` recebe `interrupted` no histórico de reprodu
 
 Na instalação Playlist Digital local consultada (versão 5.0.6.16), `C:\Playlist\pgm\PLAYLIST.ini` está em formato `AUTO` para blocos comerciais e musicais; os arquivos `Grades\GRADE.txt` e `Mapas\MAPA.txt` fornecem horários e sequências. Os arquivos de grade/mapa examinados não contêm parâmetros `FIXO` ou `DESCARTE`; isso não permite concluir como as opções por operador estão configuradas dentro da interface. A inspeção foi somente de leitura.
 
-O HitMo oferece a política por bloco, como solicitado nesta fase; não modela permissões de operador para alterar essa configuração durante a operação. A transição `Fixo` só inicia depois que o processo de automação está ativo e tem um item PGM para reduzir. Se o processo acordar depois do horário, registra a ocorrência e executa corte imediato como recuperação tardia, anotando o motivo.
+O HitMo oferece a política por bloco, como solicitado nesta fase; não modela permissões de operador para alterar essa configuração durante a operação. A transição `Fixo` só inicia depois que o processo de automação está ativo e tem um item PGM para reduzir. A partir da Fase 3A.5, se o processo retomar mais de 1000 ms depois do horário, registra a ocorrência como perdida e mantém o PGM atual, sem executar um corte tardio.
 
 O manual também descreve opções independentes para blocos vazios, pausa e retomada automática. Essas opções não existem como configurações equivalentes no HitMo. Para esta fase, preserva-se o comportamento atual: bloco vazio é ignorado, não cria ocorrência nem interrompe o áudio. O HitMo também não determina a transição por duração estimada do bloco; o limite é o horário do próximo bloco materializado.
 
