@@ -260,6 +260,19 @@ class FolderDialog(QDialog):
             self.category.addItem(label, int(category["id"]))
         index = self.category.findData(self.record.get("category_id"))
         self.category.setCurrentIndex(max(0, index))
+        self.jingle_rotation_enabled = QCheckBox("Habilitar rodízio equilibrado de vinhetas")
+        self.jingle_rotation_enabled.setChecked(
+            bool(self.record.get("jingle_rotation_enabled", self.category.currentText() == "Vinheta"))
+        )
+        self.jingle_repeat_cooldown = QSpinBox()
+        self.jingle_repeat_cooldown.setRange(0, 100)
+        self.jingle_repeat_cooldown.setValue(int(self.record.get("jingle_repeat_cooldown", 2)))
+        self.jingle_repeat_cooldown.setToolTip(
+            "Quantidade de seleções recentes desta pasta a evitar quando houver alternativas. "
+            "Se o acervo for menor que a regra, o rodízio relaxa o cooldown para continuar a programação."
+        )
+        self._last_folder_category = self.category.currentText()
+        self.category.currentIndexChanged.connect(self._update_jingle_rotation_controls)
         self.icon = QLineEdit(str(self.record.get("icon_path", "")))
         browse = QPushButton("Ícone compartilhado…")
         browse.clicked.connect(self._browse_icon)
@@ -270,12 +283,30 @@ class FolderDialog(QDialog):
         form.addRow("Nome da pasta", self.name)
         form.addRow("Diretório visível ao servidor", self.path)
         form.addRow("Categoria", self.category)
+        form.addRow("Regra automática", self.jingle_rotation_enabled)
+        form.addRow("Evitar seleções recentes", self.jingle_repeat_cooldown)
         form.addRow("Caminho do ícone", icon_row)
         form.addRow(QLabel("O servidor verifica se o diretório existe. Use UNC para um compartilhamento de rede; o cadastro preserva o caminho se estiver indisponível."))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._accept_if_valid)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+        self._update_jingle_rotation_controls()
+        self.jingle_rotation_enabled.toggled.connect(
+            lambda enabled: self.jingle_repeat_cooldown.setEnabled(enabled and self.category.currentText() == "Vinheta")
+        )
+
+    def _update_jingle_rotation_controls(self):
+        is_jingle_folder = self.category.currentText() == "Vinheta"
+        if is_jingle_folder and self._last_folder_category != "Vinheta":
+            self.jingle_rotation_enabled.setChecked(True)
+        self._last_folder_category = self.category.currentText()
+        self.jingle_rotation_enabled.setEnabled(is_jingle_folder)
+        self.jingle_repeat_cooldown.setEnabled(is_jingle_folder and self.jingle_rotation_enabled.isChecked())
+        self.jingle_rotation_enabled.setToolTip(
+            "Disponível para pastas da categoria Vinheta. A seleção é registrada no servidor e não equivale à confirmação de execução."
+            if is_jingle_folder else "A categoria da pasta precisa ser Vinheta para habilitar este rodízio."
+        )
 
     def _browse_icon(self):
         path, _ = QFileDialog.getOpenFileName(self, "Selecionar ícone compartilhado", self.icon.text(), "Imagens (*.png *.ico *.svg *.jpg *.jpeg);;Todos os arquivos (*)")
@@ -289,7 +320,13 @@ class FolderDialog(QDialog):
         self.accept()
 
     def values(self) -> dict:
-        return {"name": self.name.text().strip(), "path": self.path.text().strip(), "category_id": self.category.currentData(), "icon_path": self.icon.text().strip()}
+        is_jingle_folder = self.category.currentText() == "Vinheta"
+        return {
+            "name": self.name.text().strip(), "path": self.path.text().strip(),
+            "category_id": self.category.currentData(), "icon_path": self.icon.text().strip(),
+            "jingle_rotation_enabled": bool(is_jingle_folder and self.jingle_rotation_enabled.isChecked()),
+            "jingle_repeat_cooldown": self.jingle_repeat_cooldown.value(),
+        }
 
 
 class ConfigManagerWindow(QMainWindow):
@@ -397,7 +434,7 @@ class ConfigManagerWindow(QMainWindow):
         category_layout.addLayout(category_actions)
         self.tabs.addTab(category_tab, "Categorias")
 
-        self.folder_table = self._table(["ID", "Pasta", "Categoria", "Diretório", "Disponibilidade", "Ícone", "Materiais", "Estado"])
+        self.folder_table = self._table(["ID", "Pasta", "Categoria", "Rodízio de vinhetas", "Diretório", "Disponibilidade", "Ícone", "Materiais", "Estado"])
         self.folder_table.itemSelectionChanged.connect(self._folder_selection_changed)
         self.folder_table.cellDoubleClicked.connect(lambda *_: self.edit_folder())
         folder_tab = QWidget()
@@ -561,7 +598,11 @@ class ConfigManagerWindow(QMainWindow):
             self.folder_table.insertRow(row)
             path_state = item.get("path_exists_on_server")
             available = "Disponível" if path_state is True else ("UNC · teste físico pendente" if path_state is None else "Indisponível no servidor")
-            values = (item["id"], item["name"], item.get("category") or "—", item["path"], available, item.get("icon_path", ""), item.get("material_count", 0), "Ativa" if item.get("active") else "Inativa")
+            rotation = (
+                f"Ativo · evitar {item.get('jingle_repeat_cooldown', 0)}"
+                if item.get("jingle_rotation_enabled") and item.get("category") == "Vinheta" else "—"
+            )
+            values = (item["id"], item["name"], item.get("category") or "—", rotation, item["path"], available, item.get("icon_path", ""), item.get("material_count", 0), "Ativa" if item.get("active") else "Inativa")
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(str(value))
                 cell.setData(ROLE, item)

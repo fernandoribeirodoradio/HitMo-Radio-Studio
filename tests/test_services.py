@@ -178,6 +178,18 @@ class ServiceTests(unittest.TestCase):
         expected = [int(row["id"]) for row in self.db.all("SELECT id FROM media WHERE folder_id=? ORDER BY title COLLATE NOCASE,path COLLATE NOCASE,id", (folder_id,))]
         return folder_id, expected
 
+    def _jingle_folder_with_tracks(self, names, cooldown=2):
+        folder_path = self.root / "Vinhetas" / "Rotação"
+        folder_path.mkdir(parents=True, exist_ok=True)
+        category_id = int(self.db.one("SELECT id FROM material_categories WHERE name='Vinheta'")["id"])
+        folder_id = self.db.execute(
+            "INSERT INTO media_folders(name,path,category_id,jingle_rotation_enabled,jingle_repeat_cooldown) VALUES(?,?,?,?,?)",
+            ("Rodízio da emissora", str(folder_path), category_id, 1, cooldown),
+        )
+        files = [make_wav(folder_path / f"{name}.wav") for name in names]
+        self.library.import_paths(files, category="Vinheta", folder_id=folder_id)
+        return folder_id, [int(row["id"]) for row in self.db.all("SELECT id FROM media WHERE folder_id=? ORDER BY title COLLATE NOCASE,path COLLATE NOCASE,id", (folder_id,))]
+
     def test_sequential_folder_selection_is_ordered_and_persists_after_service_restart(self):
         folder_id, expected = self._music_folder_with_tracks(["Zulu", "Alpha", "Mike"])
         block_id = self.programming.add_block("Sequencial", "Música", "12:30", list(range(7)))
@@ -233,6 +245,51 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNone(items[1]["media_id"])
         self.assertEqual(items[1]["status"], "failed")
         self.assertIn("já foram usados nesta ocorrência", items[1]["error_message"])
+
+    def test_jingle_rotation_balances_usage_persists_cooldown_and_is_not_air_history(self):
+        folder_id, members = self._jingle_folder_with_tracks(["ID", "Passagem", "Assinatura"])
+        self.programming = ProgrammingService(self.db, random.Random(31))
+        block_id = self.programming.add_block("Vinhetas", "Música", "12:30", list(range(7)))
+        self.programming.add_block_folder(block_id, folder_id, "jingle_rotation")
+        selected_ids = []
+        first_snapshot = None
+        for day in range(16, 22):
+            occurrence_id = self.programming.due(datetime(2026, 11, day, 12, 30))[0]
+            item = self.db.one("SELECT * FROM program_occurrence_items WHERE occurrence_id=?", (occurrence_id,))
+            selected_ids.append(int(item["media_id"]))
+            first_snapshot = first_snapshot or item
+
+        for index, media_id in enumerate(selected_ids):
+            self.assertNotIn(media_id, selected_ids[max(0, index - 2):index])
+        state = self.db.one("SELECT counts_json,recent_ids_json,total_selected FROM jingle_rotation_state WHERE folder_id=?", (folder_id,))
+        counts = {int(key): int(value) for key, value in json.loads(state["counts_json"]).items()}
+        self.assertEqual(set(counts), set(members))
+        self.assertLessEqual(max(counts.values()) - min(counts.values()), 1)
+        self.assertEqual(int(state["total_selected"]), 6)
+        self.assertEqual((first_snapshot["selection_mode"], int(first_snapshot["selection_folder_id"])), ("jingle_rotation", folder_id))
+        self.assertTrue(first_snapshot["selected_at"])
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM playback_history")["n"], 0)
+
+        restarted = ProgrammingService(Database(self.db.path), random.Random(32))
+        next_occurrence = restarted.due(datetime(2026, 11, 22, 12, 30))[0]
+        next_item = self.db.one("SELECT media_id,selection_mode FROM program_occurrence_items WHERE occurrence_id=?", (next_occurrence,))
+        self.assertNotIn(int(next_item["media_id"]), selected_ids[-2:])
+        self.assertEqual(next_item["selection_mode"], "jingle_rotation")
+        self.assertEqual(int(self.db.one("SELECT total_selected FROM jingle_rotation_state WHERE folder_id=?", (folder_id,))["total_selected"]), 7)
+
+    def test_jingle_cooldown_relaxes_for_small_pool_but_not_within_same_occurrence(self):
+        folder_id, members = self._jingle_folder_with_tracks(["Um", "Dois"], cooldown=10)
+        block_id = self.programming.add_block("Vinhetas compactas", "Música", "12:30", list(range(7)))
+        self.programming.add_block_folder(block_id, folder_id, "jingle_rotation")
+        self.programming.add_block_folder(block_id, folder_id, "jingle_rotation")
+        occurrence_id = self.programming.due(datetime(2026, 11, 16, 12, 30))[0]
+        items = self.db.all("SELECT media_id,status FROM program_occurrence_items WHERE occurrence_id=? ORDER BY position", (occurrence_id,))
+        self.assertEqual({int(item["media_id"]) for item in items}, set(members))
+        self.assertTrue(all(item["status"] == "planned" for item in items))
+        next_occurrence = self.programming.due(datetime(2026, 11, 17, 12, 30))[0]
+        next_items = self.db.all("SELECT media_id,status FROM program_occurrence_items WHERE occurrence_id=? ORDER BY position", (next_occurrence,))
+        self.assertEqual({int(item["media_id"]) for item in next_items}, set(members))
+        self.assertTrue(all(item["status"] == "planned" for item in next_items))
 
     def test_configured_material_folder_and_category_do_not_delete_files(self):
         folder = self.root / "Spots"

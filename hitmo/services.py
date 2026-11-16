@@ -317,14 +317,23 @@ class ProgrammingService:
         return con.execute(sql, params).fetchall()
 
     def add_block_folder(self, block_id: int, folder_id: int, selection_mode: str) -> int:
-        if selection_mode not in {"sequential", "random"}:
-            raise ValueError("O modo de seleção deve ser sequencial ou aleatório.")
+        if selection_mode not in {"sequential", "random", "jingle_rotation"}:
+            raise ValueError("Modo de seleção de pasta inválido.")
         block = self.db.one("SELECT block_type FROM program_blocks WHERE id=?", (block_id,))
-        folder = self.db.one("SELECT id FROM media_folders WHERE id=? AND active=1", (folder_id,))
+        folder = self.db.one(
+            "SELECT f.id,f.jingle_rotation_enabled,c.name AS category FROM media_folders f "
+            "LEFT JOIN material_categories c ON c.id=f.category_id WHERE f.id=? AND f.active=1",
+            (folder_id,),
+        )
         if not block or not folder:
             raise ValueError("Bloco ou pasta ativa não encontrada.")
         with self.db.connect() as con:
-            candidates = self._folder_candidates(con, folder_id, block["block_type"])
+            if selection_mode == "jingle_rotation":
+                if folder["category"] != "Vinheta" or not folder["jingle_rotation_enabled"]:
+                    raise ValueError("Configure o rodízio automático nesta pasta de Vinhetas primeiro.")
+                candidates = self._jingle_candidates(con, folder_id)
+            else:
+                candidates = self._folder_candidates(con, folder_id, block["block_type"])
         if not candidates:
             raise ValueError("A pasta não contém materiais ativos compatíveis com o bloco.")
         pos = self.db.one("SELECT COALESCE(MAX(position),-1)+1 AS n FROM program_block_items WHERE block_id=?", (block_id,))
@@ -386,6 +395,66 @@ class ProgrammingService:
         )
         return next(row for row in candidates if int(row["id"]) == selected_id)
 
+    @staticmethod
+    def _jingle_candidates(con, folder_id: int):
+        return con.execute(
+            "SELECT m.* FROM media m JOIN media_folders f ON f.id=m.folder_id AND f.active=1 "
+            "JOIN material_categories c ON c.name=m.category AND c.material_kind='audio' "
+            "WHERE m.folder_id=? AND m.active=1 AND m.category='Vinheta' "
+            "ORDER BY m.title COLLATE NOCASE,m.path COLLATE NOCASE,m.id",
+            (folder_id,),
+        ).fetchall()
+
+    def _select_jingle_media(self, con, folder_id: int, excluded_ids: set[int] | None = None):
+        folder = con.execute(
+            "SELECT f.jingle_rotation_enabled,f.jingle_repeat_cooldown,c.name AS category "
+            "FROM media_folders f LEFT JOIN material_categories c ON c.id=f.category_id "
+            "WHERE f.id=? AND f.active=1",
+            (folder_id,),
+        ).fetchone()
+        if not folder or folder["category"] != "Vinheta" or not folder["jingle_rotation_enabled"]:
+            return None
+        candidates = self._jingle_candidates(con, folder_id)
+        excluded_ids = excluded_ids or set()
+        available = [row for row in candidates if int(row["id"]) not in excluded_ids]
+        if not available:
+            return None
+        state = con.execute("SELECT * FROM jingle_rotation_state WHERE folder_id=?", (folder_id,)).fetchone()
+        try:
+            raw_counts = json.loads(state["counts_json"]) if state else {}
+            counts = {str(int(key)): max(0, int(value)) for key, value in raw_counts.items()}
+        except (TypeError, ValueError, json.JSONDecodeError, AttributeError):
+            counts = {}
+        try:
+            raw_recent = json.loads(state["recent_ids_json"]) if state else []
+            recent_ids = [int(value) for value in raw_recent if str(value).isdigit()]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            recent_ids = []
+        cooldown = max(0, min(100, int(folder["jingle_repeat_cooldown"] or 0)))
+        if cooldown:
+            recent = set(recent_ids[-cooldown:])
+            cooled = [row for row in available if int(row["id"]) not in recent]
+            # A small folder must remain schedulable: relax cooldown only when
+            # every remaining candidate is inside it. Same-occurrence duplicates
+            # are still excluded by `available` above.
+            if cooled:
+                available = cooled
+        least_played = min(counts.get(str(int(row["id"])), 0) for row in available)
+        balanced = [row for row in available if counts.get(str(int(row["id"])), 0) == least_played]
+        selected = self.rng.choice(balanced)
+        selected_id = int(selected["id"])
+        counts[str(selected_id)] = counts.get(str(selected_id), 0) + 1
+        recent_ids.append(selected_id)
+        recent_ids = recent_ids[-100:]
+        con.execute(
+            "INSERT INTO jingle_rotation_state(folder_id,counts_json,recent_ids_json,total_selected,updated_at) "
+            "VALUES(?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(folder_id) DO UPDATE SET "
+            "counts_json=excluded.counts_json,recent_ids_json=excluded.recent_ids_json,"
+            "total_selected=excluded.total_selected,updated_at=CURRENT_TIMESTAMP",
+            (folder_id, json.dumps(counts, sort_keys=True, separators=(",", ":")), json.dumps(recent_ids, separators=(",", ":")), int(state["total_selected"] if state else 0) + 1),
+        )
+        return selected
+
     def remove_block_item(self, item_id: int) -> None:
         # This removes only the program reference. The media row and physical file remain.
         self.db.execute("DELETE FROM program_block_items WHERE id=?", (item_id,))
@@ -438,16 +507,32 @@ class ProgrammingService:
                         selected = None
                         if folder_id is not None and selection_mode in {"sequential", "random"}:
                             selected = self._select_folder_media(con, folder_id, selection_mode, block["block_type"], selected_ids)
+                        elif folder_id is not None and selection_mode == "jingle_rotation":
+                            selected = self._select_jingle_media(con, folder_id, selected_ids)
                         elif item["media_id"] is not None:
                             selected = item
                         selected_at = now.strftime("%Y-%m-%d %H:%M:%S")
                         if selected is None:
                             folder_title = str(item["folder_name"] or item["label"] or f"Pasta {folder_id or ''}")
-                            eligible = self._folder_candidates(con, folder_id, block["block_type"]) if folder_id is not None else []
-                            if eligible and all(int(candidate["id"]) in selected_ids for candidate in eligible):
-                                selection_error = "Todos os materiais ativos compatíveis da pasta já foram usados nesta ocorrência."
+                            if selection_mode == "jingle_rotation":
+                                eligible = self._jingle_candidates(con, folder_id) if folder_id is not None else []
+                                rotation = con.execute(
+                                    "SELECT f.jingle_rotation_enabled,c.name AS category FROM media_folders f "
+                                    "LEFT JOIN material_categories c ON c.id=f.category_id WHERE f.id=? AND f.active=1",
+                                    (folder_id,),
+                                ).fetchone() if folder_id is not None else None
+                                if not rotation or rotation["category"] != "Vinheta" or not rotation["jingle_rotation_enabled"]:
+                                    selection_error = "Rodízio automático desativado ou pasta fora da categoria Vinheta."
+                                elif eligible and all(int(candidate["id"]) in selected_ids for candidate in eligible):
+                                    selection_error = "Todas as vinhetas elegíveis já foram usadas nesta ocorrência."
+                                else:
+                                    selection_error = "Pasta sem vinhetas de áudio ativas e compatíveis no momento da seleção."
                             else:
-                                selection_error = "Pasta sem material de áudio ativo e compatível no momento da seleção."
+                                eligible = self._folder_candidates(con, folder_id, block["block_type"]) if folder_id is not None else []
+                                if eligible and all(int(candidate["id"]) in selected_ids for candidate in eligible):
+                                    selection_error = "Todos os materiais ativos compatíveis da pasta já foram usados nesta ocorrência."
+                                else:
+                                    selection_error = "Pasta sem material de áudio ativo e compatível no momento da seleção."
                             con.execute(
                                 "INSERT INTO program_occurrence_items(occurrence_id,source_item_id,media_id,position,item_kind,title,category,selection_folder_id,selection_mode,selected_at,status,ended_at,error_message) "
                                 "VALUES(?,?,NULL,?,'media',?,'',?,?,?,'failed',?,?)",

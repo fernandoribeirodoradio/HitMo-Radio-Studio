@@ -61,8 +61,16 @@ class Database:
                 CREATE TABLE IF NOT EXISTS media_folders (
                     id INTEGER PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
                     category_id INTEGER, icon_path TEXT NOT NULL DEFAULT '',
+                    jingle_rotation_enabled INTEGER NOT NULL DEFAULT 0 CHECK(jingle_rotation_enabled IN (0,1)),
+                    jingle_repeat_cooldown INTEGER NOT NULL DEFAULT 2 CHECK(jingle_repeat_cooldown BETWEEN 0 AND 100),
                     active INTEGER NOT NULL DEFAULT 1,
                     FOREIGN KEY(category_id) REFERENCES material_categories(id) ON DELETE SET NULL
+                );
+                CREATE TABLE IF NOT EXISTS jingle_rotation_state (
+                    folder_id INTEGER PRIMARY KEY, counts_json TEXT NOT NULL DEFAULT '{}',
+                    recent_ids_json TEXT NOT NULL DEFAULT '[]', total_selected INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(folder_id) REFERENCES media_folders(id)
                 );
                 CREATE TABLE IF NOT EXISTS playlist_catalogs (
                     id INTEGER PRIMARY KEY, source_path TEXT NOT NULL,
@@ -254,6 +262,10 @@ class Database:
             "program_block_items": {
                 "folder_id": "INTEGER",
                 "selection_mode": "TEXT NOT NULL DEFAULT ''",
+            },
+            "media_folders": {
+                "jingle_rotation_enabled": "INTEGER NOT NULL DEFAULT 0",
+                "jingle_repeat_cooldown": "INTEGER NOT NULL DEFAULT 2",
             },
             "program_occurrences": {
                 "program_revision_id": "INTEGER NOT NULL DEFAULT 0",

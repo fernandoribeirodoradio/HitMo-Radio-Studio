@@ -1,4 +1,5 @@
 import os
+import random
 import socket
 import subprocess
 import sys
@@ -198,6 +199,47 @@ class ProgrammingManagerIntegrationTests(unittest.TestCase):
         self.assertEqual((int(selected["media_id"]), selected["title"]), (first_id, "Alpha"))
         self.assertEqual((int(selected["selection_folder_id"]), selected["selection_mode"]), (folder_id, "sequential"))
         self.assertTrue(selected["selected_at"])
+
+    def test_remote_programming_publishes_jingle_rotation_and_records_selection_without_air_history(self):
+        folder_path = self.root / "jingle-rotation-folder"
+        folder_path.mkdir()
+        vinheta_category_id = int(self.db.one("SELECT id FROM material_categories WHERE name='Vinheta'")["id"])
+        folder = self.api.add_folder(
+            {
+                "name": "Rotação remota de vinhetas", "path": str(folder_path),
+                "category_id": vinheta_category_id, "jingle_rotation_enabled": True, "jingle_repeat_cooldown": 1,
+            },
+            self.api.version()["catalog_revision"],
+        )
+        folder_id = int(folder["id"])
+        first_id = self._add_media("jingle-rotation-a.wav", "Assinatura A", "Vinheta")
+        second_id = self._add_media("jingle-rotation-b.wav", "Assinatura B", "Vinheta")
+        self.db.execute("UPDATE media SET folder_id=? WHERE id IN (?,?)", (folder_id, first_id, second_id))
+
+        manager = ProgrammingManagerWindow(self.api, self.identity)
+        self.windows.append(manager)
+        manager.add_block_data({
+            "name": "Bloco com rodízio", "block_type": "Música", "time_of_day": "10:25",
+            "days": list(range(7)), "enabled": True,
+        })
+        manager.blocks_table.selectRow(len(manager.blocks) - 1)
+        manager.add_folder_to_block(folder_id, "jingle_rotation")
+        manager.save_draft("Rodízio remoto")
+        manager.publish_draft(confirmed=True)
+
+        program = self.api.programs()
+        selector = program["blocks"][-1]["items"][0]
+        self.assertEqual((int(selector["folder_id"]), selector["selection_mode"]), (folder_id, "jingle_rotation"))
+        history_before = int(self.db.one("SELECT COUNT(*) AS n FROM playback_history")["n"])
+        occurrence_id = ProgrammingService(self.db, random.Random(21)).due(datetime(2026, 11, 16, 10, 25))[0]
+        selected = self.db.one(
+            "SELECT media_id,selection_mode,selection_folder_id,selected_at FROM program_occurrence_items WHERE occurrence_id=?",
+            (occurrence_id,),
+        )
+        self.assertIn(int(selected["media_id"]), {first_id, second_id})
+        self.assertEqual((selected["selection_mode"], int(selected["selection_folder_id"])), ("jingle_rotation", folder_id))
+        self.assertTrue(selected["selected_at"])
+        self.assertEqual(int(self.db.one("SELECT COUNT(*) AS n FROM playback_history")["n"]), history_before)
 
 
 if __name__ == "__main__":

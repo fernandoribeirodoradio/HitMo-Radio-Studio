@@ -16,7 +16,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from hitmo.api_client import HitMoAPIClient
 from hitmo.api_service import create_api_user
-from hitmo.config_manager_app import ConfigManagerWindow
+from hitmo.config_manager_app import ConfigManagerWindow, FolderDialog
 from hitmo.database import Database
 from hitmo.main_window import MainWindow
 from hitmo.services import ProgrammingService
@@ -104,7 +104,7 @@ class ConfigManagerStudioIntegrationTests(unittest.TestCase):
         self.assertEqual(manager.material_table.rowCount(), 1)
         self.assertEqual(manager.material_table.item(0, 0).text(), str(created["id"]))
         self.assertEqual(manager.folder_table.rowCount(), 1)
-        self.assertEqual(manager.folder_table.item(0, 4).text(), "Disponível")
+        self.assertEqual(manager.folder_table.item(0, 5).text(), "Disponível")
         manager.material_table.selectRow(0)
         self.assertEqual(manager._selected_material()["id"], created["id"])
         manager.material_table.clearSelection()
@@ -187,6 +187,24 @@ class ConfigManagerStudioIntegrationTests(unittest.TestCase):
             self.fail("API não reiniciou para validar reconexão")
         manager.refresh()
         self.assertIn("Catálogo sincronizado", manager.status.text())
+
+    def test_config_manager_saves_folder_scoped_jingle_rotation_rules(self):
+        self.windows = []
+        manager = ConfigManagerWindow(self.api, self.identity, self.root / "Atalhos")
+        self.windows.append(manager)
+        dialog = FolderDialog(manager.categories, parent=manager)
+        dialog.name.setText("Vinhetas do programa")
+        folder_path = self.root / "vinhetas-do-programa"
+        folder_path.mkdir()
+        dialog.path.setText(str(folder_path))
+        dialog.category.setCurrentIndex(dialog.category.findText("Vinheta"))
+        self.assertTrue(dialog.jingle_rotation_enabled.isEnabled())
+        self.assertTrue(dialog.jingle_rotation_enabled.isChecked())
+        dialog.jingle_repeat_cooldown.setValue(4)
+
+        manager._save_entity("folder", None, dialog.values())
+        saved = next(item for item in manager.folders if item["name"] == "Vinhetas do programa")
+        self.assertEqual((saved["jingle_rotation_enabled"], saved["jingle_repeat_cooldown"]), (1, 4))
 
 
 if __name__ == "__main__":

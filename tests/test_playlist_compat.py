@@ -122,6 +122,7 @@ class PlaylistCompatibilityTests(unittest.TestCase):
             CREATE TABLE playback_history(id INTEGER PRIMARY KEY,media_id INTEGER,title TEXT NOT NULL,artist TEXT NOT NULL DEFAULT '',path TEXT NOT NULL,category TEXT NOT NULL DEFAULT 'Música',operator TEXT NOT NULL DEFAULT '',started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,ended_at TEXT NOT NULL DEFAULT '',played_seconds REAL NOT NULL DEFAULT 0);
             CREATE TABLE program_occurrence_items(id INTEGER PRIMARY KEY,occurrence_id INTEGER NOT NULL,source_item_id INTEGER,media_id INTEGER,position INTEGER NOT NULL,item_kind TEXT NOT NULL DEFAULT 'media',title TEXT NOT NULL DEFAULT '',artist TEXT NOT NULL DEFAULT '',path TEXT NOT NULL DEFAULT '',category TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'planned',started_at TEXT NOT NULL DEFAULT '',ended_at TEXT NOT NULL DEFAULT '',error_message TEXT NOT NULL DEFAULT '');
             INSERT INTO material_categories(name) VALUES('Música');
+            INSERT INTO media_folders(name,path,category_id) VALUES('Pasta antiga','C:/Archive',NULL);
             INSERT INTO media(path,title) VALUES('C:/Archive/song.wav','Canção antiga');
             INSERT INTO playback_history(media_id,title,path,operator) VALUES(1,'Canção antiga','C:/Archive/song.wav','Operador antigo');
         """)
@@ -135,6 +136,14 @@ class PlaylistCompatibilityTests(unittest.TestCase):
         self.assertIn("text_content", {row["name"] for row in migrated.all("PRAGMA table_info(media)")})
         self.assertIn("status", {row["name"] for row in migrated.all("PRAGMA table_info(playlist_items)")})
         self.assertIn("duration", {row["name"] for row in migrated.all("PRAGMA table_info(program_occurrence_items)")})
+        folder_columns = {row["name"] for row in migrated.all("PRAGMA table_info(media_folders)")}
+        self.assertIn("jingle_rotation_enabled", folder_columns)
+        self.assertIn("jingle_repeat_cooldown", folder_columns)
+        self.assertEqual(
+            int(migrated.one("SELECT jingle_rotation_enabled FROM media_folders WHERE id=1")["jingle_rotation_enabled"]),
+            0,
+        )
+        self.assertEqual(migrated.one("SELECT COUNT(*) AS n FROM jingle_rotation_state")["n"], 0)
         self.assertEqual(migrated.one("SELECT COUNT(*) AS n FROM playlist_folder_entries")["n"], 0)
 
 

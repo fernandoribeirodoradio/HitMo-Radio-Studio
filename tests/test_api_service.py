@@ -158,6 +158,71 @@ class CentralAPIProcessTests(unittest.TestCase):
         self.assertEqual(record["folder_id"], folder_id)
         self.assertFalse(record["path_exists_on_server"])
 
+    def test_folder_scoped_jingle_rotation_rules_are_validated_and_persisted(self):
+        category_id = int(self.db.one("SELECT id FROM material_categories WHERE name='Vinheta'")["id"])
+        folder = self.admin.add_folder(
+            {
+                "name": "Rodízio configurado", "path": r"\\offline\vinhetas\rodizio",
+                "category_id": category_id, "jingle_rotation_enabled": True, "jingle_repeat_cooldown": 3,
+            },
+            self.admin.version()["catalog_revision"],
+        )
+        folder_id = int(folder["id"])
+        saved = next(item for item in self.admin.folders(True)["folders"] if int(item["id"]) == folder_id)
+        self.assertEqual((saved["jingle_rotation_enabled"], saved["jingle_repeat_cooldown"]), (1, 3))
+
+        self.admin.update_folder(
+            folder_id,
+            {
+                "name": "Rodízio configurado", "path": r"\\offline\vinhetas\rodizio",
+                "category_id": category_id, "jingle_rotation_enabled": True, "jingle_repeat_cooldown": 5,
+            },
+            self.admin.version()["catalog_revision"],
+        )
+        self.assertEqual(int(self.db.one("SELECT jingle_repeat_cooldown FROM media_folders WHERE id=?", (folder_id,))["jingle_repeat_cooldown"]), 5)
+
+        music_category_id = int(self.db.one("SELECT id FROM material_categories WHERE name='Música'")["id"])
+        with self.assertRaisesRegex(RuntimeError, "422"):
+            self.admin.add_folder(
+                {
+                    "name": "Regra inválida", "path": r"\\offline\musicas\invalid",
+                    "category_id": music_category_id, "jingle_rotation_enabled": True,
+                },
+                self.admin.version()["catalog_revision"],
+            )
+
+        legacy_folder = self.admin.add_folder(
+            {
+                "name": "Pasta antiga", "path": r"\\offline\catalogo\antigo",
+                "category_id": music_category_id,
+            },
+            self.admin.version()["catalog_revision"],
+        )
+        self.admin.update_folder(
+            int(legacy_folder["id"]),
+            {
+                "name": "Pasta antiga", "path": r"\\offline\catalogo\antigo",
+                "category_id": category_id,
+            },
+            self.admin.version()["catalog_revision"],
+        )
+        self.assertEqual(
+            int(self.db.one("SELECT jingle_rotation_enabled FROM media_folders WHERE id=?", (legacy_folder["id"],))["jingle_rotation_enabled"]),
+            1,
+        )
+        self.admin.update_folder(
+            int(legacy_folder["id"]),
+            {
+                "name": "Pasta antiga", "path": r"\\offline\catalogo\antigo",
+                "category_id": music_category_id,
+            },
+            self.admin.version()["catalog_revision"],
+        )
+        self.assertEqual(
+            int(self.db.one("SELECT jingle_rotation_enabled FROM media_folders WHERE id=?", (legacy_folder["id"],))["jingle_rotation_enabled"]),
+            0,
+        )
+
     def test_remote_categories_and_folders_preserve_ids_materials_and_history(self):
         revision = self.admin.version()["catalog_revision"]
         category = self.admin.add_category(

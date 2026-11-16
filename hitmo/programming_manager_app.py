@@ -392,7 +392,11 @@ class ProgrammingManagerWindow(QMainWindow):
                 if isinstance(item, dict):
                     folder = folders_by_id.get(int(item["folder_id"]))
                     folder_name = folder.get("name", "Pasta indisponível") if folder else f"Pasta {item['folder_id']} indisponível"
-                    mode = "Sequencial" if item["selection_mode"] == "sequential" else "Aleatória sem repetição"
+                    mode = {
+                        "sequential": "Sequencial",
+                        "random": "Aleatória sem repetição",
+                        "jingle_rotation": "Rodízio equilibrado de vinhetas",
+                    }.get(item["selection_mode"], "Modo indisponível")
                     labels = (str(position + 1), folder_name, f"Pasta · {mode}", str(folder.get("path", "—")) if folder else "—")
                 else:
                     media_id = item
@@ -545,19 +549,26 @@ class ProgrammingManagerWindow(QMainWindow):
         if not ok:
             return
         folder = candidates[labels.index(selected)]
-        mode_labels = ["Sequencial (ordem alfabética)", "Aleatória (baralho sem repetição até esgotar)"]
-        selected_mode, ok = QInputDialog.getItem(self, "Modo de seleção", "Como escolher os áudios?", mode_labels, 1, False)
+        mode_options = [
+            ("Sequencial (ordem alfabética)", "sequential"),
+            ("Aleatória equilibrada (baralho sem repetição até esgotar)", "random"),
+        ]
+        if folder.get("category") == "Vinheta" and folder.get("jingle_rotation_enabled"):
+            mode_options.append(("Rodízio equilibrado de vinhetas (regra da pasta)", "jingle_rotation"))
+        mode_labels = [label for label, _mode in mode_options]
+        default_mode_index = next((index for index, (_label, mode) in enumerate(mode_options) if mode == "jingle_rotation"), 1)
+        selected_mode, ok = QInputDialog.getItem(self, "Modo de seleção", "Como escolher os áudios?", mode_labels, default_mode_index, False)
         if not ok:
             return
-        mode = "sequential" if mode_labels.index(selected_mode) == 0 else "random"
+        mode = mode_options[mode_labels.index(selected_mode)][1]
         self.add_folder_to_block(int(folder["id"]), mode)
 
     def add_folder_to_block(self, folder_id: int, selection_mode: str):
         index = self._selected_block_index()
         if index is None:
             raise ValueError("Selecione um bloco primeiro.")
-        if selection_mode not in {"sequential", "random"}:
-            raise ValueError("Escolha seleção sequencial ou aleatória.")
+        if selection_mode not in {"sequential", "random", "jingle_rotation"}:
+            raise ValueError("Escolha um modo de seleção válido.")
         self.blocks[index]["items"].append({"folder_id": int(folder_id), "selection_mode": selection_mode})
         self._changed()
         self._render_items()
@@ -577,7 +588,7 @@ class ProgrammingManagerWindow(QMainWindow):
             if any(item is None for item in block["items"]):
                 raise ValueError(f"O bloco {index} contém item antigo sem media.id. Remova ou substitua esse item explicitamente antes de salvar.")
             for item in block["items"]:
-                if isinstance(item, dict) and (item.get("selection_mode") not in {"sequential", "random"} or not isinstance(item.get("folder_id"), int)):
+                if isinstance(item, dict) and (item.get("selection_mode") not in {"sequential", "random", "jingle_rotation"} or not isinstance(item.get("folder_id"), int)):
                     raise ValueError(f"O bloco {index} contém um seletor de pasta inválido.")
 
     def save_draft(self, name: str):

@@ -160,16 +160,25 @@ def validate_program_payload(db: Database, value: Any) -> dict[str, Any]:
             if not isinstance(item, dict) or type(item.get("folder_id")) is not int or item["folder_id"] <= 0:
                 raise APIError(422, f"Bloco {index}: seletor deve ser um ID de material ou folder_id válido.")
             mode = item.get("selection_mode")
-            if mode not in {"sequential", "random"}:
-                raise APIError(422, f"Bloco {index}: selection_mode deve ser sequential ou random.")
+            if mode not in {"sequential", "random", "jingle_rotation"}:
+                raise APIError(422, f"Bloco {index}: selection_mode inválido.")
             folder_id = item["folder_id"]
-            folder = db.one("SELECT id FROM media_folders WHERE id=? AND active=1", (folder_id,))
+            folder = db.one(
+                "SELECT f.id,f.jingle_rotation_enabled,c.name AS category FROM media_folders f "
+                "LEFT JOIN material_categories c ON c.id=f.category_id WHERE f.id=? AND f.active=1",
+                (folder_id,),
+            )
             if not folder:
                 raise APIError(422, f"Pasta {folder_id} não existe ou está inativa.")
-            eligibility = (
-                " AND m.category IN ('Comercial','Vinheta')" if block_type == "Comercial"
-                else " AND m.category<>'Comercial'"
-            )
+            if mode == "jingle_rotation":
+                if folder["category"] != "Vinheta" or not folder["jingle_rotation_enabled"]:
+                    raise APIError(422, f"Pasta {folder_id} não está habilitada para rodízio de vinhetas.")
+                eligibility = " AND m.category='Vinheta'"
+            else:
+                eligibility = (
+                    " AND m.category IN ('Comercial','Vinheta')" if block_type == "Comercial"
+                    else " AND m.category<>'Comercial'"
+                )
             count = db.one(
                 "SELECT COUNT(*) AS n FROM media m LEFT JOIN material_categories c ON c.name=m.category "
                 "WHERE m.folder_id=? AND m.active=1 AND COALESCE(c.material_kind,'audio')='audio'" + eligibility,
@@ -476,8 +485,8 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
                 resource = "category" if path.endswith("categories") else "folder"
                 value = self._validate_category(body) if resource == "category" else self._validate_folder(body)
                 table = "material_categories" if resource == "category" else "media_folders"
-                columns = "name,material_kind,icon_path,active" if resource == "category" else "name,path,category_id,icon_path,active"
-                values = (value["name"], value["material_kind"], value["icon_path"], 1) if resource == "category" else (value["name"], value["path"], value["category_id"], value["icon_path"], 1)
+                columns = "name,material_kind,icon_path,active" if resource == "category" else "name,path,category_id,icon_path,jingle_rotation_enabled,jingle_repeat_cooldown,active"
+                values = (value["name"], value["material_kind"], value["icon_path"], 1) if resource == "category" else (value["name"], value["path"], value["category_id"], value["icon_path"], value["jingle_rotation_enabled"], value["jingle_repeat_cooldown"], 1)
                 placeholders = ",".join("?" for _ in values)
                 with self.server.db.connect() as con:
                     con.execute("BEGIN IMMEDIATE")
@@ -609,7 +618,17 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
                 old = self.server.db.one(f"SELECT * FROM {table} WHERE id=?", (entity_id,))
                 if not old:
                     raise APIError(404, f"{resource.capitalize()} não encontrada.")
-                value = self._validate_category({**dict(old), **body}) if resource == "category" else self._validate_folder({**dict(old), **body})
+                merged = {**dict(old), **body}
+                if resource == "folder" and "jingle_rotation_enabled" not in body:
+                    requested_category_id = merged.get("category_id")
+                    if requested_category_id != old["category_id"]:
+                        target_category = self.server.db.one(
+                            "SELECT name FROM material_categories WHERE id=?", (requested_category_id,)
+                        ) if requested_category_id is not None else None
+                        merged["jingle_rotation_enabled"] = bool(
+                            target_category and target_category["name"] == "Vinheta"
+                        )
+                value = self._validate_category(merged) if resource == "category" else self._validate_folder(merged)
                 with self.server.db.connect() as con:
                     con.execute("BEGIN IMMEDIATE")
                     self._expected_revision(con, "catalog_state")
@@ -641,7 +660,10 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
                             if categories_match:
                                 raise APIError(409, "Desvincule os materiais ou ajuste suas categorias antes de trocar a categoria da pasta.")
                         try:
-                            con.execute("UPDATE media_folders SET name=?,path=?,category_id=?,icon_path=? WHERE id=?", (value["name"], value["path"], value["category_id"], value["icon_path"], entity_id))
+                            con.execute(
+                                "UPDATE media_folders SET name=?,path=?,category_id=?,icon_path=?,jingle_rotation_enabled=?,jingle_repeat_cooldown=? WHERE id=?",
+                                (value["name"], value["path"], value["category_id"], value["icon_path"], value["jingle_rotation_enabled"], value["jingle_repeat_cooldown"], entity_id),
+                            )
                         except Exception as exc:
                             if "UNIQUE constraint failed" in str(exc):
                                 raise APIError(409, "Já existe uma pasta cadastrada com esse diretório.") from exc
@@ -804,12 +826,15 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
         path = str(body.get("path", "")).strip()
         icon_path = str(body.get("icon_path", "")).strip()
         category_id = body.get("category_id")
+        raw_rotation = body.get("jingle_rotation_enabled")
+        repeat_cooldown = body.get("jingle_repeat_cooldown", 2)
         if not name or len(name) > 200:
             raise APIError(422, "Informe o nome da pasta (até 200 caracteres).")
         if not path or len(path) > 4096 or path.startswith("hitmo://"):
             raise APIError(422, "Informe um diretório físico do servidor (máximo 4096 caracteres).")
         if len(icon_path) > 4096:
             raise APIError(422, "icon_path excede 4096 caracteres.")
+        category_name = ""
         if category_id in (None, ""):
             category_id = None
         else:
@@ -817,12 +842,32 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
                 category_id = int(category_id)
             except (TypeError, ValueError) as exc:
                 raise APIError(422, "category_id deve ser um ID de categoria.") from exc
-            category = self.server.db.one("SELECT id,active FROM material_categories WHERE id=?", (category_id,))
+            category = self.server.db.one("SELECT id,active,name FROM material_categories WHERE id=?", (category_id,))
             if not category or not category["active"]:
                 raise APIError(422, "A categoria selecionada não existe ou está inativa.")
+            category_name = str(category["name"])
+        if raw_rotation is None:
+            rotation_enabled = category_name == "Vinheta"
+        elif raw_rotation in (True, 1, "1", "true", "True"):
+            rotation_enabled = True
+        elif raw_rotation in (False, 0, "0", "false", "False"):
+            rotation_enabled = False
+        else:
+            raise APIError(422, "jingle_rotation_enabled deve ser booleano.")
+        try:
+            repeat_cooldown = int(repeat_cooldown)
+        except (TypeError, ValueError) as exc:
+            raise APIError(422, "jingle_repeat_cooldown deve ser um inteiro entre 0 e 100.") from exc
+        if not 0 <= repeat_cooldown <= 100:
+            raise APIError(422, "jingle_repeat_cooldown deve ser um inteiro entre 0 e 100.")
+        if rotation_enabled and category_name != "Vinheta":
+            raise APIError(422, "O rodízio automático só pode ser habilitado em pastas da categoria Vinheta.")
         # Do not resolve paths on a remote client. Keep the server-visible spelling,
         # including UNC paths, and validate existence from this service's machine.
-        return {"name": name, "path": path, "category_id": category_id, "icon_path": icon_path}
+        return {
+            "name": name, "path": path, "category_id": category_id, "icon_path": icon_path,
+            "jingle_rotation_enabled": int(rotation_enabled), "jingle_repeat_cooldown": repeat_cooldown,
+        }
 
     @staticmethod
     def _path_id(path: str, prefix: str) -> int:
@@ -862,8 +907,17 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
                 for item in block["items"]:
                     if isinstance(item, dict):
                         folder_id = int(item["folder_id"])
-                        folder = con.execute("SELECT id FROM media_folders WHERE id=? AND active=1", (folder_id,)).fetchone()
-                        eligibility = " AND m.category IN ('Comercial','Vinheta')" if block["block_type"] == "Comercial" else " AND m.category<>'Comercial'"
+                        folder = con.execute(
+                            "SELECT f.id,f.jingle_rotation_enabled,c.name AS category FROM media_folders f "
+                            "LEFT JOIN material_categories c ON c.id=f.category_id WHERE f.id=? AND f.active=1",
+                            (folder_id,),
+                        ).fetchone()
+                        if item.get("selection_mode") == "jingle_rotation":
+                            if not folder or folder["category"] != "Vinheta" or not folder["jingle_rotation_enabled"]:
+                                raise APIError(409, f"A pasta {folder_id} não está habilitada para rodízio automático de vinhetas; atualize o rascunho.")
+                            eligibility = " AND m.category='Vinheta'"
+                        else:
+                            eligibility = " AND m.category IN ('Comercial','Vinheta')" if block["block_type"] == "Comercial" else " AND m.category<>'Comercial'"
                         available = con.execute(
                             "SELECT 1 FROM media m LEFT JOIN material_categories c ON c.name=m.category "
                             "WHERE m.folder_id=? AND m.active=1 AND COALESCE(c.material_kind,'audio')='audio'" + eligibility + " LIMIT 1",
