@@ -54,6 +54,14 @@ python -m hitmo.config_manager_app
 
 Ou execute `run_config_manager.bat`. O aplicativo conecta-se ao serviço central por HTTP no computador local ou HTTPS/TLS na rede. Categorias e pastas são consultadas; a edição remota delas não está disponível nesta versão.
 
+Para montar, revisar e publicar grades remotamente, execute também:
+
+```powershell
+python -m hitmo.programming_manager_app
+```
+
+Ou abra `run_programming_manager.bat`. O módulo cria rascunhos revisionados, organiza blocos musicais/comerciais e sequências, publica quando a revisão-base ainda é atual e consulta ocorrências materializadas e histórico real. O serviço central não oferece comandos remotos de reprodução. Detalhes e limites em [docs/programacao-remota.md](docs/programacao-remota.md).
+
 ## Executar o protótipo original
 
 O arquivo `main.py` permanece integralmente preservado e mantém a entrada e os comportamentos do protótipo remoto:
@@ -82,8 +90,10 @@ Os testes cobrem banco SQLite, importação e classificação de mídia, playlis
 - `hitmo/database.py` e `hitmo/services.py`: persistência SQLite e serviços de mídia, playlist, timeline e histórico.
 - `hitmo/main_window.py`, `hitmo/config_manager.py` e `hitmo/operator_dialog.py`: interface e configuração.
 - `hitmo/config_manager_app.py`: aplicativo desktop ConfigManager independente, conectado pela API central.
+- `hitmo/programming_manager_app.py`: editor remoto de grades, blocos e sequências com rascunhos/publicação.
 - `hitmo/api_client.py`, `hitmo/api_service.py` e `hitmo/server.py`: cliente, API e processo central.
 - `hitmo/shortcuts.py`: cartões referenciais locais `.hitmo.json`, indexados pelo `media.id`.
 - `tests/`: testes automatizados.
 - `docs/reference-analysis.md`: análise funcional das referências.
 - `docs/config-manager.md`: operação e limites do aplicativo independente.
+- `docs/programacao-remota.md`: edição remota, publicação segura e consulta da execução.

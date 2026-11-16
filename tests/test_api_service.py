@@ -223,6 +223,10 @@ class CentralAPIProcessTests(unittest.TestCase):
         self.assertEqual(occurrence["status"], "running")
         self.assertEqual((item["title"], item["path"], item["status"]), ("Frozen title", str(audio), "playing"))
         self.assertEqual(self.db.one("SELECT status FROM playback_history")["status"], "playing")
+        visible = self.admin.occurrences("2026-11-16", "2026-11-16", "running")["occurrences"]
+        self.assertEqual(len(visible), 1)
+        self.assertEqual(visible[0]["items"][0]["title"], "Frozen title")
+        self.assertEqual(len(self.admin.history()["history"]), 1)
 
     def test_repeated_clients_and_program_drafts_are_isolated(self):
         with ThreadPoolExecutor(max_workers=2) as pool:

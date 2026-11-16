@@ -2,7 +2,7 @@
 
 ## Arquitetura e limites
 
-O serviço roda no computador da rádio e é o único ponto de acesso remoto ao banco SQLite. Não compartilhe o arquivo do banco em uma unidade de rede. A API serve cadastro, consulta e programação; não expõe comandos do motor de áudio. Os clientes remotos ainda não têm uma interface gráfica própria.
+O serviço roda no computador da rádio e é o único ponto de acesso remoto ao banco SQLite. Não compartilhe o arquivo do banco em uma unidade de rede. A API serve cadastro, consulta e programação; não expõe comandos do motor de áudio. As estações remotas podem usar o ConfigManager e o módulo de Programação Remota independentes.
 
 O serviço inicia em `127.0.0.1:8765`, acessível apenas no computador local. Endereços LAN exigem TLS com certificado e chave. HTTP sem TLS em endereço não local é recusado. A autenticação da API não substitui as contas do Windows, firewall nem as regras de segurança da rede.
 
@@ -59,6 +59,7 @@ Todas as rotas abaixo, exceto `/healthz`, exigem HTTP Basic Auth sobre loopback 
 | `POST /api/v1/materials/{id}/deactivate` | Edição | Desativar cadastro sem apagar arquivo nem histórico |
 | `POST /api/v1/materials/{id}/restore` | Edição | Restaurar cadastro desativado |
 | `GET /api/v1/programs` | Leitura | Revisão e blocos salvos |
+| `GET /api/v1/occurrences` | Leitura | Ocorrências já materializadas pelo agendador, com itens e estados; filtros `from`, `to`, `status`, `limit`, `offset` |
 | `GET, POST /api/v1/program-drafts` | Leitura ou edição | Listar e criar rascunhos baseados em revisão |
 | `GET, PUT /api/v1/program-drafts/{id}` | Leitura ou edição | Consultar e alterar rascunho próprio |
 | `POST /api/v1/program-drafts/{id}/publish` | Edição | Publicar se a revisão-base ainda for atual |
@@ -66,6 +67,8 @@ Todas as rotas abaixo, exceto `/healthz`, exigem HTTP Basic Auth sobre loopback 
 | `GET /api/v1/clients` | Admin | Clientes autenticados recentemente ativos |
 
 Publicar uma programação altera os blocos salvos para execuções futuras. Ocorrências já geradas, seus itens congelados e o histórico não são removidos ou reescritos. Materiais são desativados logicamente, nunca apagados da unidade de armazenamento. A revisão de catálogo e a revisão de programação são separadas.
+
+A edição e publicação remotas estão disponíveis pelo módulo independente `python -m hitmo.programming_manager_app`; consulte [programacao-remota.md](programacao-remota.md). O endpoint de ocorrências contém somente itens que o agendador já criou no horário do disparo. Definições recorrentes futuras são consultadas em `/api/v1/programs`; não são tratadas como execução.
 
 O serviço retorna os campos do registro, `material_kind` derivado da categoria e `path_exists_on_server`. Escritas aceitam `folder_id` para uma pasta ativa existente, `text_content` para categorias de tipo texto, e `icon_path` como metadado de imagem. Um caminho indisponível pode ser preservado no cadastro sem trocar o ID. Para itens não sonoros sem arquivo, são aceitas referências lógicas `hitmo://text/...` ou `hitmo://material/...`; elas não são caminhos físicos nem são executáveis pelo agendador de áudio.
 

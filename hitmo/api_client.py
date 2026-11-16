@@ -88,6 +88,11 @@ class HitMoAPIClient:
     def programs(self):
         return self.request("GET", "/api/v1/programs")
 
+    def occurrences(self, start_date: str = "", end_date: str = "", status: str = "", limit: int = 200, offset: int = 0):
+        from urllib.parse import urlencode
+        params = {"from": start_date, "to": end_date, "status": status, "limit": int(limit), "offset": int(offset)}
+        return self.request("GET", "/api/v1/occurrences?" + urlencode({key: value for key, value in params.items() if value != ""}))
+
     def drafts(self):
         return self.request("GET", "/api/v1/program-drafts")
 

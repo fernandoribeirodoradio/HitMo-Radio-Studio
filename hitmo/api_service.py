@@ -318,6 +318,59 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
                 state = self.server.db.one("SELECT revision FROM program_state WHERE id=1")
                 self._send(200, {"saved_revision": int(state["revision"]), "blocks": programs, "running": [_jsonable(row) for row in running]})
                 return
+            if path == "/api/v1/occurrences":
+                self._authenticate("program.read")
+                start_date = query.get("from", [""])[0]
+                end_date = query.get("to", [""])[0]
+                try:
+                    if start_date:
+                        datetime.strptime(start_date, "%Y-%m-%d")
+                    if end_date:
+                        datetime.strptime(end_date, "%Y-%m-%d")
+                    limit = max(1, min(500, int(query.get("limit", ["200"])[0])))
+                    offset = max(0, min(1_000_000, int(query.get("offset", ["0"])[0])))
+                except ValueError as exc:
+                    raise APIError(400, "Datas devem usar AAAA-MM-DD; limit e offset devem ser inteiros.") from exc
+                if start_date and end_date and start_date > end_date:
+                    raise APIError(400, "A data inicial deve ser anterior ou igual à data final.")
+                status = query.get("status", [""])[0]
+                allowed_statuses = {"planned", "running", "completed", "interrupted", "failed", "skipped", "stopped"}
+                if status and status not in allowed_statuses:
+                    raise APIError(400, "Situação de ocorrência inválida.")
+                clauses = []
+                params: list[Any] = []
+                if start_date:
+                    clauses.append("scheduled_for>=?")
+                    params.append(start_date + " 00:00")
+                if end_date:
+                    clauses.append("scheduled_for<=?")
+                    params.append(end_date + " 23:59")
+                if status:
+                    clauses.append("status=?")
+                    params.append(status)
+                where = " WHERE " + " AND ".join(clauses) if clauses else ""
+                with self.server.db.connect() as con:
+                    occurrence_rows = con.execute(
+                        "SELECT * FROM program_occurrences" + where + " ORDER BY scheduled_for DESC,id DESC LIMIT ? OFFSET ?",
+                        (*params, limit, offset),
+                    ).fetchall()
+                    occurrences = [_jsonable(row) for row in occurrence_rows]
+                    occurrence_ids = [int(row["id"]) for row in occurrence_rows]
+                    if occurrence_ids:
+                        marks = ",".join("?" for _ in occurrence_ids)
+                        item_rows = con.execute(
+                            f"SELECT * FROM program_occurrence_items WHERE occurrence_id IN ({marks}) ORDER BY occurrence_id,position,id",
+                            occurrence_ids,
+                        ).fetchall()
+                    else:
+                        item_rows = []
+                items_by_occurrence: dict[int, list[dict[str, Any]]] = {}
+                for item in item_rows:
+                    items_by_occurrence.setdefault(int(item["occurrence_id"]), []).append(_jsonable(item))
+                for occurrence in occurrences:
+                    occurrence["items"] = items_by_occurrence.get(int(occurrence["id"]), [])
+                self._send(200, {"occurrences": occurrences, "limit": limit, "offset": offset})
+                return
             if path == "/api/v1/program-drafts":
                 user = self._authenticate("program.read")
                 rows = self.server.db.all(
