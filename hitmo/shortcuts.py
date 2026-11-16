@@ -14,10 +14,11 @@ def _owns_shortcut(value, media_id: int) -> bool:
     return isinstance(value, dict) and value.get("format") == SHORTCUT_FORMAT and value.get("media_id") == media_id
 
 
-def reconcile_shortcuts(materials: Iterable[dict], directory: Path | str) -> dict[str, int]:
+def reconcile_shortcuts(materials: Iterable[dict], directory: Path | str, categories: Iterable[dict] | None = None) -> dict[str, int]:
     """Create/update HitMo reference cards without copying or moving media files."""
     folder = Path(directory)
     folder.mkdir(parents=True, exist_ok=True)
+    category_icons = {str(item.get("name", "")): str(item.get("icon_path", "")) for item in (categories or [])}
     result = {"created": 0, "updated": 0, "preserved": 0, "errors": 0}
     expected_names: set[str] = set()
     for material in materials:
@@ -33,7 +34,7 @@ def reconcile_shortcuts(materials: Iterable[dict], directory: Path | str) -> dic
             "category": str(material.get("category", "")),
             "material_kind": str(material.get("material_kind", "audio")),
             "path": str(material.get("path", "")),
-            "icon_path": str(material.get("icon_path", "")),
+            "icon_path": str(material.get("icon_path") or category_icons.get(str(material.get("category", "")), "")),
             "active": bool(material.get("active", 1)),
         }
         existed = target.exists()

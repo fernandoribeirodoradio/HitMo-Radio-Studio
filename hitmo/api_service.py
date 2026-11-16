@@ -88,11 +88,23 @@ def _jsonable(row) -> dict[str, Any]:
 def _material_json(row) -> dict[str, Any]:
     result = _jsonable(row)
     path = str(result.get("path") or "")
+    if path.startswith("hitmo://"):
+        result["path_exists_on_server"] = False
+        return result
+    if _is_unc_path(path):
+        # Avoid blocking API worker threads on unavailable SMB shares. Network
+        # path validation is an explicit physical-station check, not an HTTP read.
+        result["path_exists_on_server"] = None
+        return result
     try:
-        result["path_exists_on_server"] = bool(path and not path.startswith("hitmo://") and Path(path).is_file())
+        result["path_exists_on_server"] = bool(path and Path(path).is_file())
     except OSError:
         result["path_exists_on_server"] = False
     return result
+
+
+def _is_unc_path(path: str) -> bool:
+    return path.replace("/", "\\").startswith("\\\\")
 
 
 def _parse_days(value: Any) -> list[int]:
@@ -261,17 +273,27 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/v1/categories":
                 self._authenticate("catalog.read")
                 active_only = query.get("include_inactive", ["0"])[0] != "1"
-                sql = "SELECT * FROM material_categories" + (" WHERE active=1" if active_only else "") + " ORDER BY name COLLATE NOCASE"
+                sql = "SELECT c.*, (SELECT COUNT(*) FROM media m WHERE m.category=c.name) AS material_count FROM material_categories c" + (" WHERE c.active=1" if active_only else "") + " ORDER BY c.name COLLATE NOCASE"
                 self._send(200, {"categories": [_jsonable(row) for row in self.server.db.all(sql)]})
                 return
             if path == "/api/v1/folders":
                 self._authenticate("catalog.read")
                 active_only = query.get("include_inactive", ["0"])[0] != "1"
-                sql = "SELECT f.*,c.name AS category FROM media_folders f LEFT JOIN material_categories c ON c.id=f.category_id"
+                sql = "SELECT f.*,c.name AS category, (SELECT COUNT(*) FROM media m WHERE m.folder_id=f.id) AS material_count FROM media_folders f LEFT JOIN material_categories c ON c.id=f.category_id"
                 if active_only:
                     sql += " WHERE f.active=1"
                 sql += " ORDER BY f.name COLLATE NOCASE"
-                self._send(200, {"folders": [_jsonable(row) for row in self.server.db.all(sql)]})
+                folders = [_jsonable(row) for row in self.server.db.all(sql)]
+                for folder in folders:
+                    path = str(folder["path"] or "")
+                    if _is_unc_path(path):
+                        folder["path_exists_on_server"] = None
+                    else:
+                        try:
+                            folder["path_exists_on_server"] = bool(path and Path(path).is_dir())
+                        except OSError:
+                            folder["path_exists_on_server"] = False
+                self._send(200, {"folders": folders})
                 return
             if path == "/api/v1/playlist-references":
                 self._authenticate("catalog.read")
@@ -423,6 +445,35 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             path = urlsplit(self.path).path.rstrip("/") or "/"
+            if path in {"/api/v1/categories", "/api/v1/folders"}:
+                user = self._authenticate("catalog.write")
+                body = self._body()
+                resource = "category" if path.endswith("categories") else "folder"
+                value = self._validate_category(body) if resource == "category" else self._validate_folder(body)
+                table = "material_categories" if resource == "category" else "media_folders"
+                columns = "name,material_kind,icon_path,active" if resource == "category" else "name,path,category_id,icon_path,active"
+                values = (value["name"], value["material_kind"], value["icon_path"], 1) if resource == "category" else (value["name"], value["path"], value["category_id"], value["icon_path"], 1)
+                placeholders = ",".join("?" for _ in values)
+                with self.server.db.connect() as con:
+                    con.execute("BEGIN IMMEDIATE")
+                    self._expected_revision(con, "catalog_state")
+                    if resource == "category":
+                        duplicate = con.execute("SELECT id FROM material_categories WHERE name=? COLLATE NOCASE", (value["name"],)).fetchone()
+                    else:
+                        duplicate = con.execute("SELECT id FROM media_folders WHERE path=? COLLATE NOCASE", (value["path"],)).fetchone()
+                    if duplicate:
+                        raise APIError(409, "Já existe um cadastro com esse nome ou diretório.", {"id": int(duplicate["id"])})
+                    try:
+                        cur = con.execute(f"INSERT INTO {table}({columns}) VALUES({placeholders})", values)
+                    except Exception as exc:
+                        if "UNIQUE constraint failed" in str(exc):
+                            raise APIError(409, "Já existe um cadastro com esse nome ou diretório.") from exc
+                        raise
+                    ident = int(cur.lastrowid)
+                    self._audit(con, user, "create", resource, ident, value["name"])
+                revision = int(self.server.db.one("SELECT revision FROM catalog_state WHERE id=1")["revision"])
+                self._send(201, {"id": ident, "revision": revision})
+                return
             if path == "/api/v1/materials":
                 user = self._authenticate("catalog.write")
                 body = self._body()
@@ -490,6 +541,24 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
                 revision = int(self.server.db.one("SELECT revision FROM catalog_state WHERE id=1")["revision"])
                 self._send(200, {"id": media_id, "active": action == "restore", "revision": revision})
                 return
+            if re.fullmatch(r"/api/v1/(?:categories|folders)/\d+/(?:deactivate|restore)", path):
+                user = self._authenticate("catalog.write")
+                parts = path.split("/")
+                resource = "category" if parts[3] == "categories" else "folder"
+                table = "material_categories" if resource == "category" else "media_folders"
+                action = parts[5]
+                entity_id = int(parts[4])
+                with self.server.db.connect() as con:
+                    con.execute("BEGIN IMMEDIATE")
+                    self._expected_revision(con, "catalog_state")
+                    row = con.execute(f"SELECT id,active FROM {table} WHERE id=?", (entity_id,)).fetchone()
+                    if not row:
+                        raise APIError(404, f"{resource.capitalize()} não encontrada.")
+                    con.execute(f"UPDATE {table} SET active=? WHERE id=?", (0 if action == "deactivate" else 1, entity_id))
+                    self._audit(con, user, action, resource, entity_id)
+                revision = int(self.server.db.one("SELECT revision FROM catalog_state WHERE id=1")["revision"])
+                self._send(200, {"id": entity_id, "active": action == "restore", "revision": revision})
+                return
             if re.fullmatch(r"/api/v1/program-drafts/\d+/publish", path):
                 user = self._authenticate("program.write")
                 draft_id = int(path.split("/")[4])
@@ -505,6 +574,57 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:
         try:
             path = urlsplit(self.path).path.rstrip("/") or "/"
+            match = re.fullmatch(r"/api/v1/(categories|folders)/(\d+)", path)
+            if match:
+                user = self._authenticate("catalog.write")
+                resource = "category" if match.group(1) == "categories" else "folder"
+                entity_id = int(match.group(2))
+                table = "material_categories" if resource == "category" else "media_folders"
+                body = self._body()
+                old = self.server.db.one(f"SELECT * FROM {table} WHERE id=?", (entity_id,))
+                if not old:
+                    raise APIError(404, f"{resource.capitalize()} não encontrada.")
+                value = self._validate_category({**dict(old), **body}) if resource == "category" else self._validate_folder({**dict(old), **body})
+                with self.server.db.connect() as con:
+                    con.execute("BEGIN IMMEDIATE")
+                    self._expected_revision(con, "catalog_state")
+                    if resource == "category":
+                        duplicate = con.execute("SELECT id FROM material_categories WHERE name=? COLLATE NOCASE AND id<>?", (value["name"], entity_id)).fetchone()
+                        if duplicate:
+                            raise APIError(409, "Já existe uma categoria com esse nome.", {"id": int(duplicate["id"])})
+                        if value["material_kind"] != old["material_kind"]:
+                            linked = con.execute("SELECT 1 FROM media WHERE category=? LIMIT 1", (old["name"],)).fetchone()
+                            if linked:
+                                raise APIError(409, "O tipo de categoria não pode mudar enquanto houver materiais vinculados.")
+                        try:
+                            con.execute("UPDATE material_categories SET name=?,material_kind=?,icon_path=? WHERE id=?", (value["name"], value["material_kind"], value["icon_path"], entity_id))
+                        except Exception as exc:
+                            if "UNIQUE constraint failed" in str(exc):
+                                raise APIError(409, "Já existe uma categoria com esse nome.") from exc
+                            raise
+                        if value["name"] != old["name"]:
+                            con.execute("UPDATE media SET category=?,revision=revision+1 WHERE category=?", (value["name"], old["name"]))
+                            con.execute("UPDATE timeline_events SET category=? WHERE category=?", (value["name"], old["name"]))
+                    else:
+                        duplicate = con.execute("SELECT id FROM media_folders WHERE path=? COLLATE NOCASE AND id<>?", (value["path"], entity_id)).fetchone()
+                        if duplicate:
+                            raise APIError(409, "Já existe uma pasta com esse diretório.", {"id": int(duplicate["id"])})
+                        linked = con.execute("SELECT m.category FROM media m WHERE m.folder_id=? LIMIT 1", (entity_id,)).fetchone()
+                        if linked and value["category_id"] is not None:
+                            new_category = con.execute("SELECT name FROM material_categories WHERE id=?", (value["category_id"],)).fetchone()
+                            categories_match = con.execute("SELECT 1 FROM media WHERE folder_id=? AND category<>? LIMIT 1", (entity_id, new_category["name"])).fetchone() if new_category else True
+                            if categories_match:
+                                raise APIError(409, "Desvincule os materiais ou ajuste suas categorias antes de trocar a categoria da pasta.")
+                        try:
+                            con.execute("UPDATE media_folders SET name=?,path=?,category_id=?,icon_path=? WHERE id=?", (value["name"], value["path"], value["category_id"], value["icon_path"], entity_id))
+                        except Exception as exc:
+                            if "UNIQUE constraint failed" in str(exc):
+                                raise APIError(409, "Já existe uma pasta cadastrada com esse diretório.") from exc
+                            raise
+                    self._audit(con, user, "update", resource, entity_id, value.get("path", value["name"]))
+                revision = int(self.server.db.one("SELECT revision FROM catalog_state WHERE id=1")["revision"])
+                self._send(200, {"id": entity_id, "revision": revision})
+                return
             if re.fullmatch(r"/api/v1/materials/\d+", path):
                 user = self._authenticate("catalog.write")
                 media_id = int(path.rsplit("/", 1)[1])
@@ -610,12 +730,16 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
             resolved = path
             modified = 0.0
         elif path:
-            resolved = str(Path(path).expanduser().resolve())
-            try:
-                modified = Path(resolved).stat().st_mtime
-            except OSError:
-                # Keep the catalog record and ID when a local or shared path is offline.
+            if _is_unc_path(path):
+                resolved = path
                 modified = 0.0
+            else:
+                resolved = str(Path(path).expanduser().resolve())
+                try:
+                    modified = Path(resolved).stat().st_mtime
+                except OSError:
+                    # Keep the catalog record and ID when a local path is offline.
+                    modified = 0.0
         elif material_kind == "audio":
             raise APIError(422, "Materiais de áudio precisam de um caminho físico.")
         else:
@@ -636,6 +760,44 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
             "text_content": text_content,
             "folder_id": folder_id,
         }
+
+    @staticmethod
+    def _validate_category(body: dict[str, Any]) -> dict[str, Any]:
+        name = str(body.get("name", "")).strip()
+        kind = str(body.get("material_kind", "audio")).strip().lower()
+        icon_path = str(body.get("icon_path", "")).strip()
+        if not name or len(name) > 200:
+            raise APIError(422, "Informe o nome da categoria (até 200 caracteres).")
+        if kind not in {"audio", "text", "file"}:
+            raise APIError(422, "material_kind deve ser audio, text ou file.")
+        if len(icon_path) > 4096:
+            raise APIError(422, "icon_path excede 4096 caracteres.")
+        return {"name": name, "material_kind": kind, "icon_path": icon_path}
+
+    def _validate_folder(self, body: dict[str, Any]) -> dict[str, Any]:
+        name = str(body.get("name", "")).strip()
+        path = str(body.get("path", "")).strip()
+        icon_path = str(body.get("icon_path", "")).strip()
+        category_id = body.get("category_id")
+        if not name or len(name) > 200:
+            raise APIError(422, "Informe o nome da pasta (até 200 caracteres).")
+        if not path or len(path) > 4096 or path.startswith("hitmo://"):
+            raise APIError(422, "Informe um diretório físico do servidor (máximo 4096 caracteres).")
+        if len(icon_path) > 4096:
+            raise APIError(422, "icon_path excede 4096 caracteres.")
+        if category_id in (None, ""):
+            category_id = None
+        else:
+            try:
+                category_id = int(category_id)
+            except (TypeError, ValueError) as exc:
+                raise APIError(422, "category_id deve ser um ID de categoria.") from exc
+            category = self.server.db.one("SELECT id,active FROM material_categories WHERE id=?", (category_id,))
+            if not category or not category["active"]:
+                raise APIError(422, "A categoria selecionada não existe ou está inativa.")
+        # Do not resolve paths on a remote client. Keep the server-visible spelling,
+        # including UNC paths, and validate existence from this service's machine.
+        return {"name": name, "path": path, "category_id": category_id, "icon_path": icon_path}
 
     @staticmethod
     def _path_id(path: str, prefix: str) -> int:

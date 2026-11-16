@@ -25,9 +25,9 @@ No computador da rádio, o serviço deve estar ativo. Para acesso pela LAN, ele 
 
 ## Catálogo e arquivos
 
-A edição usa os campos existentes do catálogo: `media.id` (somente identidade), título, artista, categoria, caminho, duração, descrição, ícone e `text_content` (campo adicionado por migração). `material_kind` vem de `material_categories`; tipo não é inferido do nome ou extensão. A tabela mostra ID, título, artista, tipo, categoria, caminho físico, disponibilidade no servidor e estado. Pesquisa filtra nome, artista e caminho; filtros permitem categoria, pasta e estado. Pastas existentes podem ser atribuídas a materiais; criação/edição remota de pastas e categorias não está disponível nesta versão. `modified`, `added_at`, `deactivated_at` e revisões permanecem dados do servidor, não são editáveis pelo operador.
+A edição usa os campos existentes do catálogo: `media.id` (somente identidade), título, artista, categoria, caminho, duração, descrição, ícone e `text_content` (campo adicionado por migração). `material_kind` vem de `material_categories`; tipo não é inferido do nome ou extensão. A tabela mostra ID, título, artista, tipo, categoria, caminho físico, disponibilidade no servidor e estado. Pesquisa filtra nome, artista e caminho; filtros permitem categoria, pasta e estado. A Fase 2D permite criar, editar, desativar e restaurar categorias e pastas remotamente. Nomes de categoria são propagados aos cadastros atuais e eventos de timeline; o histórico e itens de ocorrências materializadas preservam seus snapshots. A troca de tipo de uma categoria usada por materiais é recusada. `modified`, `added_at`, `deactivated_at` e revisões permanecem dados do servidor, não são editáveis pelo operador.
 
-A seleção de arquivo pode usar diretórios locais ou UNC visíveis pela estação. O caminho é enviado ao serviço; o arquivo não é copiado. O serviço tenta validar o caminho no computador da rádio e retorna `path_exists_on_server`. Um caminho ausente é salvo e indicado como ausente, mantendo o ID para que possa ser corrigido depois. Ao editar caminho, a operação atualiza o registro existente. Um caminho já pertencente a outro registro gera conflito em vez de criar duplicata.
+A seleção de arquivo pode usar diretórios locais ou UNC visíveis pela estação. O caminho é enviado ao serviço; o arquivo não é copiado. Para caminhos locais, o serviço valida disponibilidade na máquina da rádio. Caminhos UNC são preservados literalmente e exibidos como teste físico pendente: consultar SMB síncronamente poderia manter uma resposta HTTP bloqueada quando o compartilhamento estivesse fora do ar. O teste de acesso ao UNC precisa ser realizado com a rede e as credenciais da emissora. Um caminho ausente é salvo e indicado, mantendo o ID para que possa ser corrigido depois. Ao editar caminho, a operação atualiza o registro existente. Um caminho já pertencente a outro registro gera conflito em vez de criar duplicata.
 
 O modelo anterior exige `media.path` não nulo. Para materiais não sonoros sem arquivo, a migração aditiva cria `text_content`, e o ConfigManager usa uma referência lógica `hitmo://text/{token}` ou `hitmo://material/{token}`; isso não é caminho de arquivo e não é executável pelo motor de áudio. Textos existentes em arquivo podem continuar apontando ao arquivo original. O tipo de material é lido da categoria; não se convertem silenciosamente textos ou arquivos em áudio.
 
@@ -37,7 +37,7 @@ A aba **Referências Folders.xml** consulta o snapshot existente pela rota somen
 
 Em `%APPDATA%\HitMo Radio Studio\Atalhos`, o app reconcilia cartões JSON próprios `.hitmo.json`, identificados por `media.id`, e mostra as representações com ícone na aba **Atalhos HitMo**. Eles guardam referências ao caminho e aos metadados do material; não copiam áudio. Atalhos próprios ausentes são recriados. Arquivos existentes só são atualizados se tiverem o formato HitMo reconhecido e o mesmo ID; outros arquivos permanecem intocados. Cartões antigos sem registro correspondente não são removidos automaticamente. Duplo clique na representação abre a edição do cadastro.
 
-O ícone do material é um caminho de imagem; ele é armazenado como metadado e exibido se estiver acessível na estação. A API não envia nem copia arquivos de ícone. Ícones por categoria são preservados no catálogo, mas a API atual não os edita remotamente.
+O ícone do material é um caminho de imagem; ele é armazenado como metadado e exibido se estiver acessível na estação. A API não envia nem copia arquivos de ícone. Os atalhos usam o ícone próprio do material e, se vazio, recorrem ao ícone de categoria. Pastas e categorias também aceitam caminhos de ícones compartilhados; o arquivo precisa estar acessível às estações que devem exibi-lo.
 
 ## Integração com o Studio e limites
 
@@ -45,9 +45,9 @@ O Studio verifica `catalog_state.revision` periodicamente. Ao detectar uma revis
 
 Limites desta entrega:
 
-- Pastas e categorias estão em modo de consulta; criação e edição remotas ainda não são suportadas pela API.
+- Caminhos de pasta são metadados e não movem fisicamente nenhum arquivo. Diretórios locais são verificados no servidor; caminhos UNC são mantidos sem consulta de rede bloqueante e ficam marcados para teste físico. A alteração de caminho da pasta não reescreve os caminhos dos materiais nela vinculados.
 - Os snapshots Playlist são somente leitura e o endpoint retorna a importação mais recente; associações semânticas com registros HitMo não são inferidas.
-- A disponibilidade exibida é verificada no computador do serviço, que é o teste relevante para operação. O compartilhamento e as credenciais de rede precisam estar configurados no servidor.
+- A disponibilidade de caminhos locais é verificada no computador do serviço. UNC fica como teste pendente para não bloquear respostas HTTP; acesso ao compartilhamento e credenciais do serviço exigem validação física na rede.
 - Não há teste em duas máquinas físicas neste ambiente. Os testes de API local não validam firewall, certificados implantados ou rede real.
 - O cartão `.hitmo.json` é um atalho referencial próprio do HitMo, não um atalho Shell `.lnk` e não integra o menu Iniciar do Windows.
 

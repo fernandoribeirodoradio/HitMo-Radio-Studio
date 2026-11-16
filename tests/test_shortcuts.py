@@ -7,6 +7,21 @@ from hitmo.shortcuts import SHORTCUT_FORMAT, reconcile_shortcuts
 
 
 class ShortcutReconciliationTests(unittest.TestCase):
+    def test_material_uses_own_icon_before_category_icon(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            directory = root / "Atalhos"
+            categories = [{"name": "Música", "icon_path": "\\\\radio\\icons\\music.ico"}]
+            material = {"id": 7, "title": "Faixa", "category": "Música", "icon_path": "", "path": "X:/Faixa.wav"}
+            result = reconcile_shortcuts([material], directory, categories)
+            self.assertEqual(result["created"], 1)
+            card = json.loads((directory / "material-7.hitmo.json").read_text(encoding="utf-8"))
+            self.assertEqual(card["icon_path"], categories[0]["icon_path"])
+            material["icon_path"] = "C:/material.png"
+            reconcile_shortcuts([material], directory, categories)
+            card = json.loads((directory / "material-7.hitmo.json").read_text(encoding="utf-8"))
+            self.assertEqual(card["icon_path"], "C:/material.png")
+
     def test_catalog_shortcuts_are_id_based_and_recreated_without_copying_media(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

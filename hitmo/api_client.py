@@ -66,6 +66,26 @@ class HitMoAPIClient:
         flag = "1" if include_inactive else "0"
         return self.request("GET", f"/api/v1/folders?include_inactive={flag}")
 
+    def add_category(self, category: dict, catalog_revision: int):
+        return self.request("POST", "/api/v1/categories", body=category, revision=catalog_revision)
+
+    def update_category(self, category_id: int, category: dict, catalog_revision: int):
+        return self.request("PUT", f"/api/v1/categories/{int(category_id)}", body=category, revision=catalog_revision)
+
+    def set_category_active(self, category_id: int, active: bool, catalog_revision: int):
+        action = "restore" if active else "deactivate"
+        return self.request("POST", f"/api/v1/categories/{int(category_id)}/{action}", body={}, revision=catalog_revision)
+
+    def add_folder(self, folder: dict, catalog_revision: int):
+        return self.request("POST", "/api/v1/folders", body=folder, revision=catalog_revision)
+
+    def update_folder(self, folder_id: int, folder: dict, catalog_revision: int):
+        return self.request("PUT", f"/api/v1/folders/{int(folder_id)}", body=folder, revision=catalog_revision)
+
+    def set_folder_active(self, folder_id: int, active: bool, catalog_revision: int):
+        action = "restore" if active else "deactivate"
+        return self.request("POST", f"/api/v1/folders/{int(folder_id)}/{action}", body={}, revision=catalog_revision)
+
     def playlist_references(self):
         return self.request("GET", "/api/v1/playlist-references")
 

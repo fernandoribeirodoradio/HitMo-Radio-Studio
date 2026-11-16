@@ -158,6 +158,84 @@ class CentralAPIProcessTests(unittest.TestCase):
         self.assertEqual(record["folder_id"], folder_id)
         self.assertFalse(record["path_exists_on_server"])
 
+    def test_remote_categories_and_folders_preserve_ids_materials_and_history(self):
+        revision = self.admin.version()["catalog_revision"]
+        category = self.admin.add_category(
+            {"name": "Jingles extras", "material_kind": "audio", "icon_path": "\\\\radio\\icons\\jingle.png"},
+            revision,
+        )
+        category_id = category["id"]
+        missing_directory = r"\\radio-offline\audio\jingles"
+        folder = self.admin.add_folder(
+            {"name": "Jingles do estúdio", "path": missing_directory, "category_id": category_id, "icon_path": "\\\\radio\\icons\\folder.ico"},
+            category["revision"],
+        )
+        folder_id = folder["id"]
+        folder_view = next(row for row in self.admin.folders(True)["folders"] if row["id"] == folder_id)
+        self.assertEqual(folder_view["path"], missing_directory)
+        self.assertIsNone(folder_view["path_exists_on_server"])
+
+        material_path = r"\\radio-offline\audio\jingles\launch.wav"
+        material = self.admin.add_material(
+            {"path": material_path, "title": "Lançamento", "category": "Jingles extras", "folder_id": folder_id},
+            folder["revision"],
+        )
+        media_id = material["id"]
+        material_view = next(row for row in self.admin.materials(True)["materials"] if row["id"] == media_id)
+        self.assertEqual(material_view["path"], material_path)
+        self.assertIsNone(material_view["path_exists_on_server"])
+        block_id = self.db.execute(
+            "INSERT INTO program_blocks(name,block_type,time_of_day) VALUES('Jingles', 'Música', '11:00')"
+        )
+        self.db.execute("INSERT INTO program_block_items(block_id,media_id,position) VALUES(?,?,0)", (block_id, media_id))
+        self.db.execute(
+            "INSERT INTO playback_history(media_id,title,path,category,status) VALUES(?,?,?,'Jingles extras','completed')",
+            (media_id, "Lançamento", material_path),
+        )
+        occurrence_id = self.db.execute(
+            "INSERT INTO program_occurrences(origin_type,block_id,scheduled_for,status) VALUES('block',?,'2026-11-16 11:00','running')",
+            (block_id,),
+        )
+        self.db.execute(
+            "INSERT INTO program_occurrence_items(occurrence_id,media_id,position,title,path,category,status) VALUES(?,?,0,'Lançamento',?,'Jingles extras','playing')",
+            (occurrence_id, media_id, material_path),
+        )
+
+        new_category = self.admin.update_category(
+            category_id,
+            {"name": "Jingles de campanha", "material_kind": "audio", "icon_path": "\\\\radio\\icons\\campaign.png"},
+            self.admin.version()["catalog_revision"],
+        )
+        self.assertEqual(new_category["id"], category_id)
+        self.assertEqual(self.db.one("SELECT category,folder_id FROM media WHERE id=?", (media_id,))["category"], "Jingles de campanha")
+        self.assertEqual(self.db.one("SELECT media_id FROM program_block_items WHERE block_id=?", (block_id,))["media_id"], media_id)
+        self.assertEqual(self.db.one("SELECT category,status FROM playback_history WHERE media_id=?", (media_id,))["category"], "Jingles extras")
+        self.assertEqual(self.db.one("SELECT status FROM program_occurrences WHERE id=?", (occurrence_id,))["status"], "running")
+        self.assertEqual(self.db.one("SELECT category,status FROM program_occurrence_items WHERE occurrence_id=?", (occurrence_id,))["category"], "Jingles extras")
+        with self.assertRaisesRegex(RuntimeError, "409"):
+            self.admin.update_category(
+                category_id,
+                {"name": "Jingles de campanha", "material_kind": "text", "icon_path": ""},
+                self.admin.version()["catalog_revision"],
+            )
+        updated_folder = self.admin.update_folder(
+            folder_id,
+            {"name": "Jingles arquivados", "path": missing_directory + "-new", "category_id": category_id, "icon_path": ""},
+            self.admin.version()["catalog_revision"],
+        )
+        self.assertEqual(updated_folder["id"], folder_id)
+        self.assertEqual(self.db.one("SELECT folder_id FROM media WHERE id=?", (media_id,))["folder_id"], folder_id)
+        deactivated = self.admin.set_folder_active(folder_id, False, self.admin.version()["catalog_revision"])
+        self.assertFalse(deactivated["active"])
+        restored = self.admin.set_folder_active(folder_id, True, deactivated["revision"])
+        self.assertTrue(restored["active"])
+        category_off = self.admin.set_category_active(category_id, False, restored["revision"])
+        self.assertFalse(category_off["active"])
+        category_on = self.admin.set_category_active(category_id, True, category_off["revision"])
+        self.assertTrue(category_on["active"])
+        self.assertEqual(self.db.one("SELECT id FROM media WHERE id=?", (media_id,))["id"], media_id)
+        self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM api_audit_log WHERE resource IN ('category','folder')")["n"], 8)
+
     def test_path_collision_does_not_create_a_second_catalog_id(self):
         audio = self._write_audio("CaseSensitive.wav")
         self.admin.add_material(

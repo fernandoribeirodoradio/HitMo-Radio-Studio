@@ -16,7 +16,7 @@
 
 ## Tradução para o HitMo
 
-O HitMo implementa conceitos equivalentes com componentes próprios: SQLite para mídia, operador, fila, eventos de timeline e histórico; um serviço de player separado da interface; e janelas encaixáveis do Qt. A fila pode ser reordenada por arraste. A timeline associa horário, dias da semana, categoria e uma mídia, permitindo que vários eventos do mesmo horário sejam executados sequencialmente. O Config Manager do HitMo ainda está dentro do Studio e, nesta etapa, a compatibilidade com `Folders.xml` é somente de leitura; consulte [playlist-compatibility.md](playlist-compatibility.md).
+O HitMo implementa conceitos equivalentes com componentes próprios: SQLite para mídia, operador, fila, eventos de timeline e histórico; um serviço de player separado da interface; e janelas encaixáveis do Qt. A fila pode ser reordenada por arraste. A timeline associa horário, dias da semana, categoria e uma mídia, permitindo que vários eventos do mesmo horário sejam executados sequencialmente. O ConfigManager independente e o Gerenciador de Programação Remota usam o serviço central. A Fase 2D estende o primeiro com administração de categorias, pastas e ícones próprios, mantendo `Folders.xml` como snapshot preservado e sem mapeamento implícito; consulte [playlist-compatibility.md](playlist-compatibility.md).
 
 Os arquivos XML, logs e grades fornecidos foram usados para identificar entidades e fluxos de trabalho. Nenhum código, binário, interface, imagem, ícone, biblioteca ou formato interno proprietário foi copiado. As instruções operacionais contidas no manual foram tratadas como descrição do produto de referência; não alteram as instruções do usuário.
 

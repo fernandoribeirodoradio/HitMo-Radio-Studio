@@ -52,7 +52,7 @@ Inicie o ConfigManager sozinho em qualquer estação com Python 3.12 e as depend
 python -m hitmo.config_manager_app
 ```
 
-Ou execute `run_config_manager.bat`. O aplicativo conecta-se ao serviço central por HTTP no computador local ou HTTPS/TLS na rede. Categorias e pastas são consultadas; a edição remota delas não está disponível nesta versão.
+Ou execute `run_config_manager.bat`. O aplicativo conecta-se ao serviço central por HTTP no computador local ou HTTPS/TLS na rede. A Fase 2D permite administrar categorias, pastas, caminhos e ícones, além de consultar/reconciliar atalhos locais do HitMo. As referências importadas de `Folders.xml` continuam preservadas como snapshots de leitura; nenhum código do Playlist é interpretado como regra operacional sem implementação específica. Consulte [docs/fase-2d.md](docs/fase-2d.md) e [docs/playlist-compatibility.md](docs/playlist-compatibility.md).
 
 Para montar, revisar e publicar grades remotamente, execute também:
 
@@ -96,4 +96,5 @@ Os testes cobrem banco SQLite, importação e classificação de mídia, playlis
 - `tests/`: testes automatizados.
 - `docs/reference-analysis.md`: análise funcional das referências.
 - `docs/config-manager.md`: operação e limites do aplicativo independente.
+- `docs/fase-2d.md`: catálogo remoto, atalhos, compatibilidade e pendências de rede.
 - `docs/programacao-remota.md`: edição remota, publicação segura e consulta da execução.

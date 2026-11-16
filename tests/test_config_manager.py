@@ -83,6 +83,9 @@ class ConfigManagerStudioIntegrationTests(unittest.TestCase):
         manager = ConfigManagerWindow(self.api, self.identity, self.root / "Atalhos")
         studio = MainWindow()
         self.windows.extend((manager, studio))
+        self.assertTrue(manager.category_add_button.isEnabled())
+        self.assertTrue(manager.folder_add_button.isEnabled())
+        self.assertGreater(manager.category_table.rowCount(), 0)
         self.assertEqual(studio.library_list.count(), 0)
         media_path = self.root / "shared" / "station.wav"
         media_path.parent.mkdir()
@@ -100,6 +103,8 @@ class ConfigManagerStudioIntegrationTests(unittest.TestCase):
         manager.refresh()
         self.assertEqual(manager.material_table.rowCount(), 1)
         self.assertEqual(manager.material_table.item(0, 0).text(), str(created["id"]))
+        self.assertEqual(manager.folder_table.rowCount(), 1)
+        self.assertEqual(manager.folder_table.item(0, 4).text(), "Disponível")
         manager.material_table.selectRow(0)
         self.assertEqual(manager._selected_material()["id"], created["id"])
         manager.material_table.clearSelection()

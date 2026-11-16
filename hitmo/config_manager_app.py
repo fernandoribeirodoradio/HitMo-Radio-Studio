@@ -203,6 +203,95 @@ class MaterialDialog(QDialog):
         }
 
 
+class CategoryDialog(QDialog):
+    def __init__(self, record: dict | None = None, parent=None):
+        super().__init__(parent)
+        self.record = record or {}
+        self.setWindowTitle("Editar categoria" if record else "Nova categoria")
+        self.name = QLineEdit(str(self.record.get("name", "")))
+        self.kind = QComboBox()
+        for key, label in (("audio", "Áudio"), ("text", "Texto"), ("file", "Arquivo")):
+            self.kind.addItem(label, key)
+        index = self.kind.findData(self.record.get("material_kind", "audio"))
+        self.kind.setCurrentIndex(max(0, index))
+        self.icon = QLineEdit(str(self.record.get("icon_path", "")))
+        browse = QPushButton("Ícone compartilhado…")
+        browse.clicked.connect(self._browse_icon)
+        icon_row = QHBoxLayout()
+        icon_row.addWidget(self.icon, 1)
+        icon_row.addWidget(browse)
+        form = QFormLayout(self)
+        form.addRow("Nome", self.name)
+        form.addRow("Tipo de material", self.kind)
+        form.addRow("Caminho do ícone", icon_row)
+        self.kind.setToolTip("Mudar audio/text/file para uma categoria já usada é recusado para preservar o comportamento dos materiais.")
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def _browse_icon(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Selecionar ícone compartilhado", self.icon.text(), "Imagens (*.png *.ico *.svg *.jpg *.jpeg);;Todos os arquivos (*)")
+        if path:
+            self.icon.setText(path)
+
+    def _accept_if_valid(self):
+        if not self.name.text().strip():
+            QMessageBox.warning(self, "Nome obrigatório", "Informe o nome da categoria.")
+            return
+        self.accept()
+
+    def values(self) -> dict:
+        return {"name": self.name.text().strip(), "material_kind": self.kind.currentData(), "icon_path": self.icon.text().strip()}
+
+
+class FolderDialog(QDialog):
+    def __init__(self, categories: list[dict], record: dict | None = None, parent=None):
+        super().__init__(parent)
+        self.record = record or {}
+        self.setWindowTitle("Editar pasta" if record else "Nova pasta")
+        self.name = QLineEdit(str(self.record.get("name", "")))
+        self.path = QLineEdit(str(self.record.get("path", "")))
+        self.path.setPlaceholderText(r"Caminho local do servidor ou UNC: \\servidor\acervo\musicas")
+        self.category = QComboBox()
+        self.category.addItem("Sem categoria", None)
+        for category in categories:
+            label = category["name"] + (" · inativa" if not category.get("active", 1) else "")
+            self.category.addItem(label, int(category["id"]))
+        index = self.category.findData(self.record.get("category_id"))
+        self.category.setCurrentIndex(max(0, index))
+        self.icon = QLineEdit(str(self.record.get("icon_path", "")))
+        browse = QPushButton("Ícone compartilhado…")
+        browse.clicked.connect(self._browse_icon)
+        icon_row = QHBoxLayout()
+        icon_row.addWidget(self.icon, 1)
+        icon_row.addWidget(browse)
+        form = QFormLayout(self)
+        form.addRow("Nome da pasta", self.name)
+        form.addRow("Diretório visível ao servidor", self.path)
+        form.addRow("Categoria", self.category)
+        form.addRow("Caminho do ícone", icon_row)
+        form.addRow(QLabel("O servidor verifica se o diretório existe. Use UNC para um compartilhamento de rede; o cadastro preserva o caminho se estiver indisponível."))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def _browse_icon(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Selecionar ícone compartilhado", self.icon.text(), "Imagens (*.png *.ico *.svg *.jpg *.jpeg);;Todos os arquivos (*)")
+        if path:
+            self.icon.setText(path)
+
+    def _accept_if_valid(self):
+        if not self.name.text().strip() or not self.path.text().strip():
+            QMessageBox.warning(self, "Campos obrigatórios", "Informe o nome e o diretório da pasta.")
+            return
+        self.accept()
+
+    def values(self) -> dict:
+        return {"name": self.name.text().strip(), "path": self.path.text().strip(), "category_id": self.category.currentData(), "icon_path": self.icon.text().strip()}
+
+
 class ConfigManagerWindow(QMainWindow):
     def __init__(self, api: HitMoAPIClient, identity: dict, shortcuts_dir: str | Path | None = None, parent=None):
         super().__init__(parent)
@@ -283,8 +372,55 @@ class ConfigManagerWindow(QMainWindow):
         self.shortcut_table.cellDoubleClicked.connect(self._edit_shortcut_material)
         self.tabs.addTab(self.shortcut_table, "Atalhos HitMo")
 
-        self.folder_table = self._table(["ID", "Pasta", "Categoria", "Diretório", "Ícone", "Estado"])
-        self.tabs.addTab(self.folder_table, "Pastas (somente leitura)")
+        self.category_table = self._table(["ID", "Categoria", "Tipo", "Materiais", "Ícone", "Estado"])
+        self.category_table.itemSelectionChanged.connect(self._category_selection_changed)
+        self.category_table.cellDoubleClicked.connect(lambda *_: self.edit_category())
+        category_tab = QWidget()
+        category_layout = QVBoxLayout(category_tab)
+        category_layout.addWidget(self.category_table)
+        category_actions = QHBoxLayout()
+        self.category_add_button = QPushButton("Nova categoria")
+        self.category_add_button.clicked.connect(self.add_category)
+        self.category_edit_button = QPushButton("Editar")
+        self.category_edit_button.clicked.connect(self.edit_category)
+        self.category_deactivate_button = QPushButton("Desativar")
+        self.category_deactivate_button.clicked.connect(lambda: self._set_entity_active("category", False))
+        self.category_restore_button = QPushButton("Restaurar")
+        self.category_restore_button.clicked.connect(lambda: self._set_entity_active("category", True))
+        for button in (self.category_add_button, self.category_edit_button, self.category_deactivate_button, self.category_restore_button):
+            button.setEnabled(self.can_edit)
+            category_actions.addWidget(button)
+        self.category_edit_button.setEnabled(False)
+        self.category_deactivate_button.setEnabled(False)
+        self.category_restore_button.setEnabled(False)
+        category_actions.addStretch(1)
+        category_layout.addLayout(category_actions)
+        self.tabs.addTab(category_tab, "Categorias")
+
+        self.folder_table = self._table(["ID", "Pasta", "Categoria", "Diretório", "Disponibilidade", "Ícone", "Materiais", "Estado"])
+        self.folder_table.itemSelectionChanged.connect(self._folder_selection_changed)
+        self.folder_table.cellDoubleClicked.connect(lambda *_: self.edit_folder())
+        folder_tab = QWidget()
+        folder_layout = QVBoxLayout(folder_tab)
+        folder_layout.addWidget(self.folder_table)
+        folder_actions = QHBoxLayout()
+        self.folder_add_button = QPushButton("Nova pasta")
+        self.folder_add_button.clicked.connect(self.add_folder)
+        self.folder_edit_button = QPushButton("Editar")
+        self.folder_edit_button.clicked.connect(self.edit_folder)
+        self.folder_deactivate_button = QPushButton("Desativar")
+        self.folder_deactivate_button.clicked.connect(lambda: self._set_entity_active("folder", False))
+        self.folder_restore_button = QPushButton("Restaurar")
+        self.folder_restore_button.clicked.connect(lambda: self._set_entity_active("folder", True))
+        for button in (self.folder_add_button, self.folder_edit_button, self.folder_deactivate_button, self.folder_restore_button):
+            button.setEnabled(self.can_edit)
+            folder_actions.addWidget(button)
+        self.folder_edit_button.setEnabled(False)
+        self.folder_deactivate_button.setEnabled(False)
+        self.folder_restore_button.setEnabled(False)
+        folder_actions.addStretch(1)
+        folder_layout.addLayout(folder_actions)
+        self.tabs.addTab(folder_tab, "Pastas do catálogo")
         self.reference_table = self._table(["ID Playlist", "Nome", "Código original", "Destino", "Ícone original", "Argumentos", "Atalho", "Índice ícone", "Saída", "Arquivos", "DBF ID", "Alvo existia no import"])
         self.tabs.addTab(self.reference_table, "Referências Folders.xml (somente leitura)")
         layout.addWidget(self.tabs, 1)
@@ -332,7 +468,7 @@ class ConfigManagerWindow(QMainWindow):
             self._render_materials()
             self._render_shortcuts()
             self._render_references(references.get("catalog"))
-            shortcut_result = reconcile_shortcuts(self.materials, self.shortcuts_dir)
+            shortcut_result = reconcile_shortcuts(self.materials, self.shortcuts_dir, self.categories)
             self.status.setText(
                 f"Catálogo sincronizado · atalhos: {shortcut_result['created']} criados, "
                 f"{shortcut_result['updated']} atualizados, {shortcut_result['preserved']} protegidos, "
@@ -355,6 +491,19 @@ class ConfigManagerWindow(QMainWindow):
         index = self.category_filter.findData(selected)
         self.category_filter.setCurrentIndex(max(0, index))
         self.category_filter.blockSignals(False)
+        self.category_table.setRowCount(0)
+        kind_labels = {"audio": "Áudio", "text": "Texto", "file": "Arquivo"}
+        for category in self.categories:
+            row = self.category_table.rowCount()
+            self.category_table.insertRow(row)
+            values = (category["id"], category["name"], kind_labels.get(category["material_kind"], category["material_kind"]), category.get("material_count", 0), category.get("icon_path", ""), "Ativa" if category["active"] else "Inativa")
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(str(value))
+                cell.setData(ROLE, category)
+                if column == 1 and category.get("icon_path") and Path(category["icon_path"]).is_file():
+                    cell.setIcon(QIcon(category["icon_path"]))
+                self.category_table.setItem(row, column, cell)
+        self.category_table.resizeColumnsToContents()
 
     def _render_materials(self, *_):
         text = self.search.text().strip().casefold()
@@ -379,7 +528,8 @@ class ConfigManagerWindow(QMainWindow):
             row = self.material_table.rowCount()
             self.material_table.insertRow(row)
             kind = str(material.get("material_kind", "audio"))
-            available = "Disponível" if material.get("path_exists_on_server") else ("Referência lógica" if str(material.get("path", "")).startswith("hitmo://") else "Ausente no servidor")
+            path_state = material.get("path_exists_on_server")
+            available = "Disponível" if path_state is True else ("Referência lógica" if str(material.get("path", "")).startswith("hitmo://") else ("UNC · teste físico pendente" if path_state is None else "Ausente no servidor"))
             values = (
                 material["id"], material["title"], material.get("artist", ""),
                 {"audio": "Áudio", "text": "Texto/documento", "file": "Arquivo"}.get(kind, kind),
@@ -409,9 +559,15 @@ class ConfigManagerWindow(QMainWindow):
         for item in self.folders:
             row = self.folder_table.rowCount()
             self.folder_table.insertRow(row)
-            values = (item["id"], item["name"], item.get("category") or "—", item["path"], item.get("icon_path", ""), "Ativa" if item.get("active") else "Inativa")
+            path_state = item.get("path_exists_on_server")
+            available = "Disponível" if path_state is True else ("UNC · teste físico pendente" if path_state is None else "Indisponível no servidor")
+            values = (item["id"], item["name"], item.get("category") or "—", item["path"], available, item.get("icon_path", ""), item.get("material_count", 0), "Ativa" if item.get("active") else "Inativa")
             for column, value in enumerate(values):
-                self.folder_table.setItem(row, column, QTableWidgetItem(str(value)))
+                cell = QTableWidgetItem(str(value))
+                cell.setData(ROLE, item)
+                if column == 1 and item.get("icon_path") and Path(item["icon_path"]).is_file():
+                    cell.setIcon(QIcon(item["icon_path"]))
+                self.folder_table.setItem(row, column, cell)
         self.folder_table.resizeColumnsToContents()
 
     def _render_shortcuts(self):
@@ -479,6 +635,92 @@ class ConfigManagerWindow(QMainWindow):
         self.edit_button.setEnabled(self.can_edit and record is not None)
         self.deactivate_button.setEnabled(self.can_edit and record is not None and active)
         self.restore_button.setEnabled(self.can_edit and record is not None and not active)
+
+    def _selected_entity(self, table: QTableWidget) -> dict | None:
+        row = table.currentRow()
+        item = table.item(row, 0) if row >= 0 else None
+        return item.data(ROLE) if item else None
+
+    def _category_selection_changed(self):
+        record = self._selected_entity(self.category_table)
+        active = bool(record and record.get("active", 1))
+        self.category_edit_button.setEnabled(self.can_edit and record is not None)
+        self.category_deactivate_button.setEnabled(self.can_edit and record is not None and active)
+        self.category_restore_button.setEnabled(self.can_edit and record is not None and not active)
+
+    def _folder_selection_changed(self):
+        record = self._selected_entity(self.folder_table)
+        active = bool(record and record.get("active", 1))
+        self.folder_edit_button.setEnabled(self.can_edit and record is not None)
+        self.folder_deactivate_button.setEnabled(self.can_edit and record is not None and active)
+        self.folder_restore_button.setEnabled(self.can_edit and record is not None and not active)
+
+    def add_category(self):
+        if not self.can_edit:
+            return
+        dialog = CategoryDialog(parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._save_entity("category", None, dialog.values())
+
+    def edit_category(self):
+        record = self._selected_entity(self.category_table)
+        if not self.can_edit or not record:
+            return
+        dialog = CategoryDialog(record, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._save_entity("category", int(record["id"]), dialog.values())
+
+    def add_folder(self):
+        if not self.can_edit:
+            return
+        dialog = FolderDialog(self.categories, parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._save_entity("folder", None, dialog.values())
+
+    def edit_folder(self):
+        record = self._selected_entity(self.folder_table)
+        if not self.can_edit or not record:
+            return
+        dialog = FolderDialog(self.categories, record, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._save_entity("folder", int(record["id"]), dialog.values())
+
+    def _save_entity(self, resource: str, entity_id: int | None, values: dict):
+        try:
+            revision = self.api.version()["catalog_revision"]
+            if resource == "category":
+                if entity_id is None:
+                    self.api.add_category(values, revision)
+                else:
+                    self.api.update_category(entity_id, values, revision)
+            elif entity_id is None:
+                self.api.add_folder(values, revision)
+            else:
+                self.api.update_folder(entity_id, values, revision)
+        except (ConnectionError, RuntimeError, OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Alteração não salva", f"{exc}\n\nAtualize o catálogo e reaplique alterações em conflito.")
+            return
+        self.refresh()
+
+    def _set_entity_active(self, resource: str, active: bool):
+        table = self.category_table if resource == "category" else self.folder_table
+        record = self._selected_entity(table)
+        if not self.can_edit or not record:
+            return
+        verb = "restaurar" if active else "desativar"
+        retained = "Os materiais, referências, programação e histórico serão preservados."
+        if QMessageBox.question(self, f"Confirmar {verb}", f"Deseja {verb} este cadastro? {retained}") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            revision = self.api.version()["catalog_revision"]
+            if resource == "category":
+                self.api.set_category_active(int(record["id"]), active, revision)
+            else:
+                self.api.set_folder_active(int(record["id"]), active, revision)
+        except (ConnectionError, RuntimeError, OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Operação não concluída", str(exc))
+            return
+        self.refresh()
 
     def add_material(self):
         if not self.can_edit:

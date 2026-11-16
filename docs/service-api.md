@@ -52,6 +52,10 @@ Todas as rotas abaixo, exceto `/healthz`, exigem HTTP Basic Auth sobre loopback 
 | `GET /api/v1/version` | Leitura | Versão, revisão do catálogo e da programação |
 | `GET /api/v1/categories` | Leitura | Categorias; `?include_inactive=1` inclui inativas |
 | `GET /api/v1/folders` | Leitura | Pastas cadastradas |
+| `POST /api/v1/categories`, `PUT /api/v1/categories/{id}` | Edição | Criar/editar categoria; exige revisão do catálogo |
+| `POST /api/v1/categories/{id}/deactivate` e `/restore` | Edição | Desativar/restaurar categoria logicamente |
+| `POST /api/v1/folders`, `PUT /api/v1/folders/{id}` | Edição | Criar/editar diretório e associação de categoria |
+| `POST /api/v1/folders/{id}/deactivate` e `/restore` | Edição | Desativar/restaurar pasta logicamente |
 | `GET /api/v1/playlist-references` | Leitura | Snapshot mais recente de Folders.xml, sem associação automática ao catálogo |
 | `GET /api/v1/materials` | Leitura | Materiais ativos; `?include_inactive=1` inclui desativados |
 | `POST /api/v1/materials` | Edição | Cadastrar material; exige revisão do catálogo |
@@ -68,9 +72,11 @@ Todas as rotas abaixo, exceto `/healthz`, exigem HTTP Basic Auth sobre loopback 
 
 Publicar uma programação altera os blocos salvos para execuções futuras. Ocorrências já geradas, seus itens congelados e o histórico não são removidos ou reescritos. Materiais são desativados logicamente, nunca apagados da unidade de armazenamento. A revisão de catálogo e a revisão de programação são separadas.
 
+Categorias e pastas também têm identidade estável e operações lógicas, sem exclusão física. Renomear categoria atualiza os rótulos atuais de materiais e eventos futuros da timeline, preservando histórico e snapshots de ocorrências. A troca do tipo (`audio`, `text`, `file`) é recusada enquanto existirem materiais ligados. Pastas aceitam caminho local do servidor ou UNC; a disponibilidade é verificada no computador do serviço. Editar o caminho da pasta não move arquivos e não reescreve os caminhos individuais dos materiais.
+
 A edição e publicação remotas estão disponíveis pelo módulo independente `python -m hitmo.programming_manager_app`; consulte [programacao-remota.md](programacao-remota.md). O endpoint de ocorrências contém somente itens que o agendador já criou no horário do disparo. Definições recorrentes futuras são consultadas em `/api/v1/programs`; não são tratadas como execução.
 
-O serviço retorna os campos do registro, `material_kind` derivado da categoria e `path_exists_on_server`. Escritas aceitam `folder_id` para uma pasta ativa existente, `text_content` para categorias de tipo texto, e `icon_path` como metadado de imagem. Um caminho indisponível pode ser preservado no cadastro sem trocar o ID. Para itens não sonoros sem arquivo, são aceitas referências lógicas `hitmo://text/...` ou `hitmo://material/...`; elas não são caminhos físicos nem são executáveis pelo agendador de áudio.
+O serviço retorna os campos do registro, `material_kind` derivado da categoria e `path_exists_on_server` (`true`/`false` para caminhos locais; `null` para UNC ainda não validado fisicamente). Escritas aceitam `folder_id` para uma pasta ativa existente, `text_content` para categorias de tipo texto, e `icon_path` como metadado de imagem. Um caminho indisponível pode ser preservado no cadastro sem trocar o ID. Para itens não sonoros sem arquivo, são aceitas referências lógicas `hitmo://text/...` ou `hitmo://material/...`; elas não são caminhos físicos nem são executáveis pelo agendador de áudio.
 
 `GET /api/v1/playlist-references` fornece somente a importação mais recente de `Folders.xml`. Seus IDs e códigos permanecem referências do Playlist, sem associação automática aos IDs de mídia do HitMo.
 
