@@ -170,8 +170,17 @@ class Database:
                     id INTEGER PRIMARY KEY, block_id INTEGER NOT NULL, media_id INTEGER,
                     position INTEGER NOT NULL, item_kind TEXT NOT NULL DEFAULT 'media',
                     label TEXT NOT NULL DEFAULT '', pause_ms INTEGER NOT NULL DEFAULT 0,
+                    folder_id INTEGER, selection_mode TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(block_id) REFERENCES program_blocks(id) ON DELETE CASCADE,
                     FOREIGN KEY(media_id) REFERENCES media(id) ON DELETE SET NULL
+                );
+                CREATE TABLE IF NOT EXISTS folder_rotation_state (
+                    folder_id INTEGER NOT NULL, selection_mode TEXT NOT NULL,
+                    member_ids_json TEXT NOT NULL DEFAULT '[]', deck_json TEXT NOT NULL DEFAULT '[]',
+                    cursor INTEGER NOT NULL DEFAULT 0, cycle INTEGER NOT NULL DEFAULT 0,
+                    last_media_id INTEGER, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(folder_id,selection_mode),
+                    CHECK(selection_mode IN ('sequential','random'))
                 );
                 CREATE TABLE IF NOT EXISTS program_occurrences (
                     id INTEGER PRIMARY KEY, origin_type TEXT NOT NULL,
@@ -191,6 +200,7 @@ class Database:
                     media_id INTEGER, position INTEGER NOT NULL, item_kind TEXT NOT NULL DEFAULT 'media',
                     title TEXT NOT NULL DEFAULT '', artist TEXT NOT NULL DEFAULT '',
                     path TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT '', duration REAL NOT NULL DEFAULT 0,
+                    selection_folder_id INTEGER, selection_mode TEXT NOT NULL DEFAULT '', selected_at TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'planned', started_at TEXT NOT NULL DEFAULT '',
                     ended_at TEXT NOT NULL DEFAULT '', error_message TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(occurrence_id) REFERENCES program_occurrences(id) ON DELETE CASCADE,
@@ -237,6 +247,13 @@ class Database:
             },
             "program_occurrence_items": {
                 "duration": "REAL NOT NULL DEFAULT 0",
+                "selection_folder_id": "INTEGER",
+                "selection_mode": "TEXT NOT NULL DEFAULT ''",
+                "selected_at": "TEXT NOT NULL DEFAULT ''",
+            },
+            "program_block_items": {
+                "folder_id": "INTEGER",
+                "selection_mode": "TEXT NOT NULL DEFAULT ''",
             },
             "program_occurrences": {
                 "program_revision_id": "INTEGER NOT NULL DEFAULT 0",

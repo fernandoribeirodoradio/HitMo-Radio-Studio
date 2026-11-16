@@ -1,6 +1,8 @@
 import tempfile
 import unittest
 import wave
+import json
+import random
 from datetime import datetime
 from pathlib import Path
 
@@ -165,6 +167,72 @@ class ServiceTests(unittest.TestCase):
         item = self.db.one("SELECT title,path,status FROM program_occurrence_items WHERE occurrence_id=?", (occurrence_id,))
         self.assertEqual((item["title"], item["path"], item["status"]), ("Ausente", str(path), "planned"))
         self.assertFalse(Path(item["path"]).exists())
+
+    def _music_folder_with_tracks(self, names):
+        folder_path = self.root / "Músicas" / "Rotação"
+        folder_path.mkdir(parents=True, exist_ok=True)
+        category_id = int(self.db.one("SELECT id FROM material_categories WHERE name='Música'")["id"])
+        folder_id = self.library.save_folder("Rotação", str(folder_path), category_id)
+        files = [make_wav(folder_path / f"{name}.wav") for name in names]
+        self.library.import_paths(files, category="Música", folder_id=folder_id)
+        expected = [int(row["id"]) for row in self.db.all("SELECT id FROM media WHERE folder_id=? ORDER BY title COLLATE NOCASE,path COLLATE NOCASE,id", (folder_id,))]
+        return folder_id, expected
+
+    def test_sequential_folder_selection_is_ordered_and_persists_after_service_restart(self):
+        folder_id, expected = self._music_folder_with_tracks(["Zulu", "Alpha", "Mike"])
+        block_id = self.programming.add_block("Sequencial", "Música", "12:30", list(range(7)))
+        selector_id = self.programming.add_block_folder(block_id, folder_id, "sequential")
+
+        first_occurrence = self.programming.due(datetime(2026, 11, 16, 12, 30))[0]
+        first = self.db.one("SELECT * FROM program_occurrence_items WHERE occurrence_id=?", (first_occurrence,))
+        self.assertEqual((int(first["source_item_id"]), int(first["media_id"])), (selector_id, expected[0]))
+        self.assertEqual((int(first["selection_folder_id"]), first["selection_mode"]), (folder_id, "sequential"))
+        self.assertTrue(first["selected_at"])
+        self.programming.set_occurrence_item_status(int(first["id"]), "completed")
+
+        restarted = ProgrammingService(Database(self.db.path))
+        second_occurrence = restarted.due(datetime(2026, 11, 17, 12, 30))[0]
+        second = self.db.one("SELECT media_id FROM program_occurrence_items WHERE occurrence_id=?", (second_occurrence,))
+        state = self.db.one("SELECT cursor,last_media_id FROM folder_rotation_state WHERE folder_id=? AND selection_mode='sequential'", (folder_id,))
+        self.assertEqual(int(second["media_id"]), expected[1])
+        self.assertEqual((int(state["cursor"]), int(state["last_media_id"])), (2, expected[1]))
+
+    def test_random_folder_uses_persisted_shuffle_deck_without_repeats(self):
+        folder_id, _expected = self._music_folder_with_tracks(["Alpha", "Bravo", "Charlie", "Delta"])
+        self.programming = ProgrammingService(self.db, random.Random(73))
+        block_id = self.programming.add_block("Aleatório", "Música", "12:30", list(range(7)))
+        self.programming.add_block_folder(block_id, folder_id, "random")
+        self.programming.add_block_folder(block_id, folder_id, "random")
+
+        first_occurrence = self.programming.due(datetime(2026, 11, 16, 12, 30))[0]
+        first_pair = [int(row["media_id"]) for row in self.db.all("SELECT media_id FROM program_occurrence_items WHERE occurrence_id=? ORDER BY position", (first_occurrence,))]
+        self.assertEqual(len(set(first_pair)), 2)
+        state = self.db.one("SELECT deck_json,cursor FROM folder_rotation_state WHERE folder_id=? AND selection_mode='random'", (folder_id,))
+        deck = json.loads(state["deck_json"])
+        self.assertEqual(int(state["cursor"]), 2)
+
+        restarted = ProgrammingService(Database(self.db.path), random.Random(999))
+        next_occurrence = restarted.due(datetime(2026, 11, 17, 12, 30))[0]
+        next_pair = [int(row["media_id"]) for row in self.db.all("SELECT media_id FROM program_occurrence_items WHERE occurrence_id=? ORDER BY position", (next_occurrence,))]
+        self.assertEqual(next_pair[0], deck[2])
+        self.assertEqual(len(set(first_pair + next_pair)), 4)
+
+    def test_folder_selector_does_not_repeat_within_occurrence_and_records_reason(self):
+        folder_id, expected = self._music_folder_with_tracks(["Only track"])
+        block_id = self.programming.add_block("Sem repetição local", "Música", "12:30", list(range(7)))
+        self.programming.add_block_folder(block_id, folder_id, "sequential")
+        self.programming.add_block_folder(block_id, folder_id, "sequential")
+
+        occurrence_id = self.programming.due(datetime(2026, 11, 16, 12, 30))[0]
+        items = self.db.all(
+            "SELECT media_id,status,error_message FROM program_occurrence_items WHERE occurrence_id=? ORDER BY position",
+            (occurrence_id,),
+        )
+        self.assertEqual(int(items[0]["media_id"]), expected[0])
+        self.assertEqual(items[0]["status"], "planned")
+        self.assertIsNone(items[1]["media_id"])
+        self.assertEqual(items[1]["status"], "failed")
+        self.assertIn("já foram usados nesta ocorrência", items[1]["error_message"])
 
     def test_configured_material_folder_and_category_do_not_delete_files(self):
         folder = self.root / "Spots"

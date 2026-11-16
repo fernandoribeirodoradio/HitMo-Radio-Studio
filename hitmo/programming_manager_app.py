@@ -89,6 +89,7 @@ class ProgrammingManagerWindow(QMainWindow):
         self.saved_blocks: list[dict] = []
         self.blocks: list[dict] = []
         self.materials: list[dict] = []
+        self.folders: list[dict] = []
         self.drafts: list[dict] = []
         self.draft_id: int | None = None
         self.draft_revision: int | None = None
@@ -154,13 +155,15 @@ class ProgrammingManagerWindow(QMainWindow):
         item_actions = QHBoxLayout()
         self.add_item_button = QPushButton("Adicionar material")
         self.add_item_button.clicked.connect(self.add_item_dialog)
+        self.add_folder_button = QPushButton("Adicionar pasta com seleção")
+        self.add_folder_button.clicked.connect(self.add_folder_dialog)
         self.move_up_button = QPushButton("Subir")
         self.move_up_button.clicked.connect(lambda: self.move_item(-1))
         self.move_down_button = QPushButton("Descer")
         self.move_down_button.clicked.connect(lambda: self.move_item(1))
         self.remove_item_button = QPushButton("Remover do bloco")
         self.remove_item_button.clicked.connect(self.remove_item)
-        for button in (self.add_item_button, self.move_up_button, self.move_down_button, self.remove_item_button):
+        for button in (self.add_item_button, self.add_folder_button, self.move_up_button, self.move_down_button, self.remove_item_button):
             button.setEnabled(self.can_edit)
             item_actions.addWidget(button)
         item_actions.addStretch(1)
@@ -252,6 +255,7 @@ class ProgrammingManagerWindow(QMainWindow):
             identity = self.api.version()
             program = self.api.programs()
             self.materials = [item for item in self.api.materials()["materials"] if item.get("material_kind", "audio") == "audio"]
+            self.folders = self.api.folders()["folders"]
             self.saved_revision = int(program["saved_revision"])
             self.saved_blocks = self._normalize_blocks(program["blocks"])
             self.identity_label.setText(f"Conectado: {identity.get('authenticated_as', 'usuário')} ({identity.get('role', 'reader')}) · {self.api.base_url}")
@@ -284,7 +288,9 @@ class ProgrammingManagerWindow(QMainWindow):
                 "days": day_values,
                 "enabled": bool(source.get("enabled", True)),
                 "items": [
-                    (int(item["media_id"]) if item.get("media_id") is not None else None) if isinstance(item, dict)
+                    ({"folder_id": int(item["folder_id"]), "selection_mode": str(item.get("selection_mode", "random"))}
+                     if isinstance(item, dict) and item.get("folder_id") is not None
+                     else (int(item["media_id"]) if item.get("media_id") is not None else None)) if isinstance(item, dict)
                     else (int(item) if item is not None else None)
                     for item in raw_items
                 ],
@@ -381,14 +387,22 @@ class ProgrammingManagerWindow(QMainWindow):
         if index is not None:
             block = self.blocks[index]
             materials_by_id = {int(item["id"]): item for item in self.materials}
-            for position, media_id in enumerate(block["items"]):
-                media = materials_by_id.get(media_id) if media_id is not None else None
-                labels = (
-                    str(position + 1),
-                    str(media.get("title", "Material indisponível")) if media else (f"Material {media_id} indisponível" if media_id else "Material sem ID"),
-                    str(media.get("category", "—")) if media else "—",
-                    str(media.get("path", "—")) if media else "—",
-                )
+            folders_by_id = {int(item["id"]): item for item in self.folders}
+            for position, item in enumerate(block["items"]):
+                if isinstance(item, dict):
+                    folder = folders_by_id.get(int(item["folder_id"]))
+                    folder_name = folder.get("name", "Pasta indisponível") if folder else f"Pasta {item['folder_id']} indisponível"
+                    mode = "Sequencial" if item["selection_mode"] == "sequential" else "Aleatória sem repetição"
+                    labels = (str(position + 1), folder_name, f"Pasta · {mode}", str(folder.get("path", "—")) if folder else "—")
+                else:
+                    media_id = item
+                    media = materials_by_id.get(media_id) if media_id is not None else None
+                    labels = (
+                        str(position + 1),
+                        str(media.get("title", "Material indisponível")) if media else (f"Material {media_id} indisponível" if media_id else "Material sem ID"),
+                        str(media.get("category", "—")) if media else "—",
+                        str(media.get("path", "—")) if media else "—",
+                    )
                 row = self.items_table.rowCount()
                 self.items_table.insertRow(row)
                 for column, label in enumerate(labels):
@@ -408,6 +422,7 @@ class ProgrammingManagerWindow(QMainWindow):
             ("enable_block_button", editable and selected_block),
             ("remove_block_button", editable and selected_block),
             ("add_item_button", editable and selected_block),
+            ("add_folder_button", editable and selected_block),
             ("move_up_button", editable and selected_item),
             ("move_down_button", editable and selected_item),
             ("remove_item_button", editable and selected_item),
@@ -512,6 +527,41 @@ class ProgrammingManagerWindow(QMainWindow):
         if ok:
             self.add_material_to_block(int(candidates[labels.index(selected)]["id"]))
 
+    def add_folder_dialog(self):
+        index = self._selected_block_index()
+        if index is None:
+            return
+        block_type = self.blocks[index]["block_type"]
+        if block_type == "Comercial":
+            candidates = [folder for folder in self.folders if folder.get("active", 1) and folder.get("category") in {"Comercial", "Vinheta"}]
+        else:
+            candidates = [folder for folder in self.folders if folder.get("active", 1) and folder.get("category") != "Comercial"]
+        candidates = [folder for folder in candidates if int(folder.get("material_count", 0)) > 0]
+        if not candidates:
+            QMessageBox.information(self, "Programação", "Não há pastas com materiais compatíveis para este bloco.")
+            return
+        labels = [f"{folder['name']} · {folder.get('category') or 'Áudio'} · {folder.get('path', '')}" for folder in candidates]
+        selected, ok = QInputDialog.getItem(self, "Adicionar pasta", "Pasta de seleção", labels, 0, False)
+        if not ok:
+            return
+        folder = candidates[labels.index(selected)]
+        mode_labels = ["Sequencial (ordem alfabética)", "Aleatória (baralho sem repetição até esgotar)"]
+        selected_mode, ok = QInputDialog.getItem(self, "Modo de seleção", "Como escolher os áudios?", mode_labels, 1, False)
+        if not ok:
+            return
+        mode = "sequential" if mode_labels.index(selected_mode) == 0 else "random"
+        self.add_folder_to_block(int(folder["id"]), mode)
+
+    def add_folder_to_block(self, folder_id: int, selection_mode: str):
+        index = self._selected_block_index()
+        if index is None:
+            raise ValueError("Selecione um bloco primeiro.")
+        if selection_mode not in {"sequential", "random"}:
+            raise ValueError("Escolha seleção sequencial ou aleatória.")
+        self.blocks[index]["items"].append({"folder_id": int(folder_id), "selection_mode": selection_mode})
+        self._changed()
+        self._render_items()
+
     def remove_item(self):
         row = self.items_table.currentRow()
         if row >= 0:
@@ -524,8 +574,11 @@ class ProgrammingManagerWindow(QMainWindow):
 
     def _validate_for_save(self):
         for index, block in enumerate(self.blocks, start=1):
-            if any(item_id is None for item_id in block["items"]):
+            if any(item is None for item in block["items"]):
                 raise ValueError(f"O bloco {index} contém item antigo sem media.id. Remova ou substitua esse item explicitamente antes de salvar.")
+            for item in block["items"]:
+                if isinstance(item, dict) and (item.get("selection_mode") not in {"sequential", "random"} or not isinstance(item.get("folder_id"), int)):
+                    raise ValueError(f"O bloco {index} contém um seletor de pasta inválido.")
 
     def save_draft(self, name: str):
         self._validate_for_save()

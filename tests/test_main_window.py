@@ -53,6 +53,35 @@ class MainWindowIntegrationTests(unittest.TestCase):
         return bool(predicate())
 
     @staticmethod
+    def _wait_for_player_position(player, errors, timeout_ms=1500):
+        """Wait for a real position update, or fail fast on a media error."""
+        if player.position() > 0 or errors:
+            return int(player.position())
+        loop = QEventLoop()
+        timer = QTimer()
+        timer.setSingleShot(True)
+
+        def on_position(position):
+            if position > 0:
+                loop.quit()
+
+        def on_error(error, message):
+            errors.append((error, message))
+            loop.quit()
+
+        player.positionChanged.connect(on_position)
+        player.errorOccurred.connect(on_error)
+        timer.timeout.connect(loop.quit)
+        timer.start(timeout_ms)
+        # Recheck after connecting to avoid missing a position event between
+        # the initial read and signal registration.
+        if player.position() <= 0 and not errors:
+            loop.exec()
+        player.positionChanged.disconnect(on_position)
+        player.errorOccurred.disconnect(on_error)
+        return int(player.position())
+
+    @staticmethod
     def _wait_ms(milliseconds):
         loop = QEventLoop()
         QTimer.singleShot(milliseconds, loop.quit)
@@ -75,11 +104,29 @@ class MainWindowIntegrationTests(unittest.TestCase):
                 scheduled = window.db.one("SELECT * FROM media WHERE path=?", (str(scheduled_path.resolve()),))
                 block_id = window.programming.add_block("Bloco novo", "Música", "12:30", [6])
                 window.programming.add_block_item(block_id, int(scheduled["id"]))
+                player = window.engine.program
+                media_statuses = []
+                playback_states = []
+                playback_errors = []
+                player.mediaStatusChanged.connect(media_statuses.append)
+                player.playbackStateChanged.connect(playback_states.append)
+                player.errorOccurred.connect(lambda error, message: playback_errors.append((error, message)))
                 self.assertTrue(window._play_media(current, source_type="manual"))
-                self.assertTrue(self._wait_until(lambda: window.engine.program.playbackState() == QMediaPlayer.PlaybackState.PlayingState))
-                self._wait_ms(250)
-                before_position = int(window.engine.program.position())
-                self.assertGreater(before_position, 0)
+                started = self._wait_until(lambda: player.playbackState() == QMediaPlayer.PlaybackState.PlayingState, timeout_ms=2000)
+                self.assertTrue(
+                    started,
+                    f"Player não iniciou: status={media_statuses}, estados={playback_states}, erros={playback_errors}",
+                )
+                before_position = self._wait_for_player_position(player, playback_errors)
+                self.assertFalse(
+                    playback_errors,
+                    f"Erro do QMediaPlayer antes do avanço: {playback_errors}; status={media_statuses}",
+                )
+                self.assertGreater(
+                    before_position,
+                    0,
+                    f"Player iniciou, mas a posição não avançou: status={media_statuses}, estados={playback_states}",
+                )
 
                 class ControlledClock:
                     @classmethod

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import json
+import random
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -244,8 +246,9 @@ class PlaylistService:
 class ProgrammingService:
     """Persistent recurring blocks and immutable dated playback occurrences."""
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, rng: random.Random | None = None):
         self.db = db
+        self.rng = rng or random.Random()
 
     def add_block(self, name: str, block_type: str, time_of_day: str, days: list[int]) -> int:
         if block_type not in {"Música", "Comercial"}:
@@ -271,7 +274,10 @@ class ProgrammingService:
 
     def block_items(self, block_id: int):
         return self.db.all(
-            "SELECT i.id AS block_item_id,i.position,i.item_kind,m.* FROM program_block_items i LEFT JOIN media m ON m.id=i.media_id WHERE i.block_id=? ORDER BY i.position,i.id",
+            "SELECT i.id AS block_item_id,i.position,i.item_kind,i.folder_id,i.selection_mode,"
+            "f.name AS folder_name,f.path AS folder_path,m.* FROM program_block_items i "
+            "LEFT JOIN media m ON m.id=i.media_id LEFT JOIN media_folders f ON f.id=i.folder_id "
+            "WHERE i.block_id=? ORDER BY i.position,i.id",
             (block_id,),
         )
 
@@ -294,6 +300,91 @@ class ProgrammingService:
             "INSERT INTO program_block_items(block_id,media_id,position,item_kind) VALUES(?,?,?,'media')",
             (block_id, media_id, int(pos["n"])),
         )
+
+    @staticmethod
+    def _folder_candidates(con, folder_id: int, block_type: str):
+        sql = (
+            "SELECT m.* FROM media m JOIN media_folders f ON f.id=m.folder_id AND f.active=1 "
+            "LEFT JOIN material_categories c ON c.name=m.category "
+            "WHERE m.folder_id=? AND m.active=1 AND COALESCE(c.material_kind,'audio')='audio'"
+        )
+        params: list[object] = [folder_id]
+        if block_type == "Comercial":
+            sql += " AND m.category IN ('Comercial','Vinheta')"
+        elif block_type == "Música":
+            sql += " AND m.category<>'Comercial'"
+        sql += " ORDER BY m.title COLLATE NOCASE,m.path COLLATE NOCASE,m.id"
+        return con.execute(sql, params).fetchall()
+
+    def add_block_folder(self, block_id: int, folder_id: int, selection_mode: str) -> int:
+        if selection_mode not in {"sequential", "random"}:
+            raise ValueError("O modo de seleção deve ser sequencial ou aleatório.")
+        block = self.db.one("SELECT block_type FROM program_blocks WHERE id=?", (block_id,))
+        folder = self.db.one("SELECT id FROM media_folders WHERE id=? AND active=1", (folder_id,))
+        if not block or not folder:
+            raise ValueError("Bloco ou pasta ativa não encontrada.")
+        with self.db.connect() as con:
+            candidates = self._folder_candidates(con, folder_id, block["block_type"])
+        if not candidates:
+            raise ValueError("A pasta não contém materiais ativos compatíveis com o bloco.")
+        pos = self.db.one("SELECT COALESCE(MAX(position),-1)+1 AS n FROM program_block_items WHERE block_id=?", (block_id,))
+        return self.db.execute(
+            "INSERT INTO program_block_items(block_id,folder_id,position,item_kind,selection_mode) VALUES(?,?,?,'folder',?)",
+            (block_id, folder_id, int(pos["n"]), selection_mode),
+        )
+
+    def _select_folder_media(self, con, folder_id: int, selection_mode: str, block_type: str, excluded_ids: set[int] | None = None):
+        candidates = self._folder_candidates(con, folder_id, block_type)
+        excluded_ids = excluded_ids or set()
+        available_ids = {int(row["id"]) for row in candidates} - excluded_ids
+        if not available_ids:
+            return None
+        members = [int(row["id"]) for row in candidates]
+        members_json = json.dumps(members, separators=(",", ":"))
+        state = con.execute(
+            "SELECT * FROM folder_rotation_state WHERE folder_id=? AND selection_mode=?",
+            (folder_id, selection_mode),
+        ).fetchone()
+        last_media_id = int(state["last_media_id"]) if state and state["last_media_id"] is not None else None
+        cycle = int(state["cycle"]) if state else 0
+        try:
+            deck = [int(value) for value in json.loads(state["deck_json"])] if state else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            deck = []
+        cursor = int(state["cursor"]) if state else 0
+        valid_deck = len(deck) == len(members) and set(deck) == set(members)
+        if not valid_deck:
+            deck = list(members)
+            cursor = 0
+            cycle = 0
+            if selection_mode == "random":
+                self.rng.shuffle(deck)
+        selected_id = None
+        has_nonrepeat = any(media_id != last_media_id for media_id in available_ids)
+        for _attempt in range(max(1, len(deck) * 2)):
+            if cursor >= len(deck):
+                cycle += 1
+                cursor = 0
+                if selection_mode == "random":
+                    deck = list(members)
+                    self.rng.shuffle(deck)
+            candidate_id = deck[cursor]
+            cursor += 1
+            if candidate_id in available_ids and (not has_nonrepeat or candidate_id != last_media_id):
+                selected_id = candidate_id
+                break
+        if selected_id is None:
+            # All remaining candidates would repeat a media item already placed
+            # in this same occurrence; leave this selector auditable as failed.
+            return None
+        con.execute(
+            "INSERT INTO folder_rotation_state(folder_id,selection_mode,member_ids_json,deck_json,cursor,cycle,last_media_id,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(folder_id,selection_mode) DO UPDATE SET "
+            "member_ids_json=excluded.member_ids_json,deck_json=excluded.deck_json,cursor=excluded.cursor,"
+            "cycle=excluded.cycle,last_media_id=excluded.last_media_id,updated_at=CURRENT_TIMESTAMP",
+            (folder_id, selection_mode, members_json, json.dumps(deck, separators=(",", ":")), cursor, cycle, selected_id),
+        )
+        return next(row for row in candidates if int(row["id"]) == selected_id)
 
     def remove_block_item(self, item_id: int) -> None:
         # This removes only the program reference. The media row and physical file remain.
@@ -322,7 +413,10 @@ class ProgrammingService:
                 if weekday not in {int(x) for x in block["days"].split(",") if x.strip().isdigit()}:
                     continue
                 items = con.execute(
-                    "SELECT i.id,i.media_id,i.position,i.item_kind,m.title,m.artist,m.path,m.category,m.duration FROM program_block_items i JOIN media m ON m.id=i.media_id WHERE i.block_id=? ORDER BY i.position,i.id",
+                    "SELECT i.id,i.media_id,i.folder_id,i.selection_mode,i.position,i.item_kind,i.label,"
+                    "f.name AS folder_name,m.title,m.artist,m.path,m.category,m.duration "
+                    "FROM program_block_items i LEFT JOIN media m ON m.id=i.media_id "
+                    "LEFT JOIN media_folders f ON f.id=i.folder_id WHERE i.block_id=? ORDER BY i.position,i.id",
                     (int(block["id"]),),
                 ).fetchall()
                 if not items:
@@ -335,11 +429,42 @@ class ProgrammingService:
                     occurrence_id = int(cursor.lastrowid)
                     created.append(occurrence_id)
                     created_block = True
+                    # Folder selections avoid tracks explicitly fixed elsewhere
+                    # in this block and choices already materialized for it.
+                    selected_ids = {int(row["media_id"]) for row in items if row["media_id"] is not None}
                     for item in items:
+                        folder_id = int(item["folder_id"]) if item["folder_id"] is not None else None
+                        selection_mode = str(item["selection_mode"] or "")
+                        selected = None
+                        if folder_id is not None and selection_mode in {"sequential", "random"}:
+                            selected = self._select_folder_media(con, folder_id, selection_mode, block["block_type"], selected_ids)
+                        elif item["media_id"] is not None:
+                            selected = item
+                        selected_at = now.strftime("%Y-%m-%d %H:%M:%S")
+                        if selected is None:
+                            folder_title = str(item["folder_name"] or item["label"] or f"Pasta {folder_id or ''}")
+                            eligible = self._folder_candidates(con, folder_id, block["block_type"]) if folder_id is not None else []
+                            if eligible and all(int(candidate["id"]) in selected_ids for candidate in eligible):
+                                selection_error = "Todos os materiais ativos compatíveis da pasta já foram usados nesta ocorrência."
+                            else:
+                                selection_error = "Pasta sem material de áudio ativo e compatível no momento da seleção."
+                            con.execute(
+                                "INSERT INTO program_occurrence_items(occurrence_id,source_item_id,media_id,position,item_kind,title,category,selection_folder_id,selection_mode,selected_at,status,ended_at,error_message) "
+                                "VALUES(?,?,NULL,?,'media',?,'',?,?,?,'failed',?,?)",
+                                (occurrence_id, int(item["id"]), int(item["position"]), f"Pasta indisponível: {folder_title}", folder_id, selection_mode, selected_at, selected_at, selection_error),
+                            )
+                            continue
+                        selected_ids.add(int(selected["id"] if "id" in selected.keys() else selected["media_id"]))
                         con.execute(
-                            "INSERT INTO program_occurrence_items(occurrence_id,source_item_id,media_id,position,item_kind,title,artist,path,category,duration) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                            (occurrence_id, int(item["id"]), int(item["media_id"]), int(item["position"]), item["item_kind"], item["title"], item["artist"], item["path"], item["category"], item["duration"]),
+                            "INSERT INTO program_occurrence_items(occurrence_id,source_item_id,media_id,position,item_kind,title,artist,path,category,duration,selection_folder_id,selection_mode,selected_at) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (occurrence_id, int(item["id"]), int(selected["id"] if "id" in selected.keys() else selected["media_id"]), int(item["position"]), "media", selected["title"], selected["artist"], selected["path"], selected["category"], selected["duration"], folder_id, selection_mode, selected_at),
                         )
+                    if not con.execute(
+                        "SELECT 1 FROM program_occurrence_items WHERE occurrence_id=? AND status='planned' LIMIT 1",
+                        (occurrence_id,),
+                    ).fetchone():
+                        con.execute("UPDATE program_occurrences SET status='failed' WHERE id=?", (occurrence_id,))
             if created_block:
                 # The next scheduled block is the documented cutoff. Never stop
                 # an item already loading/playing; discard only remaining inserts

@@ -136,25 +136,48 @@ def validate_program_payload(db: Database, value: Any) -> dict[str, Any]:
         days = _parse_days(source.get("days"))
         items = source.get("items", [])
         if not isinstance(items, list) or len(items) > 500:
-            raise APIError(422, f"Bloco {index}: items deve ser uma lista com até 500 IDs.")
-        media_items = []
-        for item_id in items:
-            if type(item_id) is not int or item_id <= 0:
-                raise APIError(422, f"Bloco {index}: ID de material inválido.")
-            media = db.one(
-                "SELECT m.id,m.category,COALESCE(c.material_kind,'audio') AS material_kind "
-                "FROM media m LEFT JOIN material_categories c ON c.name=m.category "
-                "WHERE m.id=? AND m.active=1", (item_id,),
+            raise APIError(422, f"Bloco {index}: items deve ser uma lista com até 500 seletores.")
+        normalized_items = []
+        for item in items:
+            if type(item) is int:
+                if item <= 0:
+                    raise APIError(422, f"Bloco {index}: ID de material inválido.")
+                media = db.one(
+                    "SELECT m.id,m.category,COALESCE(c.material_kind,'audio') AS material_kind "
+                    "FROM media m LEFT JOIN material_categories c ON c.name=m.category "
+                    "WHERE m.id=? AND m.active=1", (item,),
+                )
+                if not media:
+                    raise APIError(422, f"Material {item} não existe ou está inativo.")
+                if media["material_kind"] != "audio":
+                    raise APIError(422, f"Material {item} não é áudio executável.")
+                if block_type == "Comercial" and media["category"] not in {"Comercial", "Vinheta"}:
+                    raise APIError(422, f"Material {item} não pode entrar em bloco comercial.")
+                if block_type == "Música" and media["category"] == "Comercial":
+                    raise APIError(422, f"Material comercial {item} não pode entrar em bloco musical.")
+                normalized_items.append(item)
+                continue
+            if not isinstance(item, dict) or type(item.get("folder_id")) is not int or item["folder_id"] <= 0:
+                raise APIError(422, f"Bloco {index}: seletor deve ser um ID de material ou folder_id válido.")
+            mode = item.get("selection_mode")
+            if mode not in {"sequential", "random"}:
+                raise APIError(422, f"Bloco {index}: selection_mode deve ser sequential ou random.")
+            folder_id = item["folder_id"]
+            folder = db.one("SELECT id FROM media_folders WHERE id=? AND active=1", (folder_id,))
+            if not folder:
+                raise APIError(422, f"Pasta {folder_id} não existe ou está inativa.")
+            eligibility = (
+                " AND m.category IN ('Comercial','Vinheta')" if block_type == "Comercial"
+                else " AND m.category<>'Comercial'"
             )
-            if not media:
-                raise APIError(422, f"Material {item_id} não existe ou está inativo.")
-            if media["material_kind"] != "audio":
-                raise APIError(422, f"Material {item_id} não é áudio executável.")
-            if block_type == "Comercial" and media["category"] not in {"Comercial", "Vinheta"}:
-                raise APIError(422, f"Material {item_id} não pode entrar em bloco comercial.")
-            if block_type == "Música" and media["category"] == "Comercial":
-                raise APIError(422, f"Material comercial {item_id} não pode entrar em bloco musical.")
-            media_items.append(item_id)
+            count = db.one(
+                "SELECT COUNT(*) AS n FROM media m LEFT JOIN material_categories c ON c.name=m.category "
+                "WHERE m.folder_id=? AND m.active=1 AND COALESCE(c.material_kind,'audio')='audio'" + eligibility,
+                (folder_id,),
+            )["n"]
+            if not count:
+                raise APIError(422, f"Pasta {folder_id} não contém materiais de áudio ativos compatíveis com o bloco.")
+            normalized_items.append({"folder_id": folder_id, "selection_mode": mode})
         block_id = source.get("id")
         if block_id is not None and (type(block_id) is not int or block_id <= 0):
             raise APIError(422, f"Bloco {index}: ID inválido.")
@@ -165,7 +188,7 @@ def validate_program_payload(db: Database, value: Any) -> dict[str, Any]:
             "time_of_day": time_of_day,
             "days": days,
             "enabled": bool(source.get("enabled", True)),
-            "items": media_items,
+            "items": normalized_items,
         })
     return {"blocks": blocks}
 
@@ -328,8 +351,10 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
                 programs = []
                 for block in blocks:
                     items = self.server.db.all(
-                        "SELECT i.id AS item_id,i.position,m.id AS media_id,m.title,m.artist,m.category,m.path "
-                        "FROM program_block_items i LEFT JOIN media m ON m.id=i.media_id WHERE i.block_id=? ORDER BY i.position,i.id",
+                        "SELECT i.id AS item_id,i.position,m.id AS media_id,m.title,m.artist,m.category,m.path,"
+                        "i.folder_id,i.selection_mode,f.name AS folder_name,f.path AS folder_path "
+                        "FROM program_block_items i LEFT JOIN media m ON m.id=i.media_id "
+                        "LEFT JOIN media_folders f ON f.id=i.folder_id WHERE i.block_id=? ORDER BY i.position,i.id",
                         (int(block["id"]),),
                     )
                     programs.append({**_jsonable(block), "items": [_jsonable(item) for item in items]})
@@ -834,7 +859,20 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
             # every referenced item inside the publish transaction so a material
             # deactivated after draft validation cannot enter the live schedule.
             for block in payload["blocks"]:
-                for media_id in block["items"]:
+                for item in block["items"]:
+                    if isinstance(item, dict):
+                        folder_id = int(item["folder_id"])
+                        folder = con.execute("SELECT id FROM media_folders WHERE id=? AND active=1", (folder_id,)).fetchone()
+                        eligibility = " AND m.category IN ('Comercial','Vinheta')" if block["block_type"] == "Comercial" else " AND m.category<>'Comercial'"
+                        available = con.execute(
+                            "SELECT 1 FROM media m LEFT JOIN material_categories c ON c.name=m.category "
+                            "WHERE m.folder_id=? AND m.active=1 AND COALESCE(c.material_kind,'audio')='audio'" + eligibility + " LIMIT 1",
+                            (folder_id,),
+                        ).fetchone()
+                        if not folder or not available:
+                            raise APIError(409, f"A pasta {folder_id} foi desativada ou não contém mais áudio compatível; atualize o rascunho.")
+                        continue
+                    media_id = int(item)
                     media = con.execute(
                         "SELECT m.category,COALESCE(c.material_kind,'audio') AS material_kind "
                         "FROM media m LEFT JOIN material_categories c ON c.name=m.category "
@@ -863,8 +901,14 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
                     ident = int(cur.lastrowid)
                 saved_ids.append(ident)
                 con.execute("DELETE FROM program_block_items WHERE block_id=?", (ident,))
-                for position, media_id in enumerate(block["items"]):
-                    con.execute("INSERT INTO program_block_items(block_id,media_id,position,item_kind) VALUES(?,?,?,'media')", (ident, media_id, position))
+                for position, item in enumerate(block["items"]):
+                    if isinstance(item, dict):
+                        con.execute(
+                            "INSERT INTO program_block_items(block_id,folder_id,selection_mode,position,item_kind) VALUES(?,?,?,?,'folder')",
+                            (ident, int(item["folder_id"]), item["selection_mode"], position),
+                        )
+                    else:
+                        con.execute("INSERT INTO program_block_items(block_id,media_id,position,item_kind) VALUES(?,?,?,'media')", (ident, int(item), position))
             revision = int(con.execute("SELECT revision FROM program_state WHERE id=1").fetchone()["revision"])
             con.execute("UPDATE api_program_drafts SET status='published',published_revision=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (revision, draft_id))
             self._audit(con, user, "publish", "program_draft", draft_id, f"program_revision={revision}; blocks={saved_ids}")

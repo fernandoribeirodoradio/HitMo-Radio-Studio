@@ -6,7 +6,7 @@ import tempfile
 import time
 import unittest
 import wave
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -160,6 +160,44 @@ class ProgrammingManagerIntegrationTests(unittest.TestCase):
         manager.refresh_history()
         self.assertGreaterEqual(manager.occurrence_table.rowCount(), 1)
         self.assertGreaterEqual(manager.history_table.rowCount(), 1)
+
+    def test_remote_programming_publishes_folder_selector_and_server_records_selected_media(self):
+        folder_path = self.root / "rotation-folder"
+        folder_path.mkdir()
+        music_category_id = int(self.db.one("SELECT id FROM material_categories WHERE name='Música'")["id"])
+        folder_id = self.db.execute(
+            "INSERT INTO media_folders(name,path,category_id) VALUES(?,?,?)",
+            ("Rotação de teste", str(folder_path), music_category_id),
+        )
+        first_id = self._add_media("Alpha.wav", "Alpha", "Música")
+        second_id = self._add_media("Bravo.wav", "Bravo", "Música")
+        self.db.execute("UPDATE media SET folder_id=? WHERE id IN (?,?)", (folder_id, first_id, second_id))
+
+        manager = ProgrammingManagerWindow(self.api, self.identity)
+        self.windows.append(manager)
+        manager.add_block_data({
+            "name": "Seleção por pasta",
+            "block_type": "Música",
+            "time_of_day": "10:15",
+            "days": list(range(7)),
+            "enabled": True,
+        })
+        manager.blocks_table.selectRow(len(manager.blocks) - 1)
+        manager.add_folder_to_block(folder_id, "sequential")
+        manager.save_draft("Rascunho por pasta")
+        draft = self.api.get_draft(manager.draft_id)
+        self.assertEqual(draft["payload"]["blocks"][-1]["items"], [{"folder_id": folder_id, "selection_mode": "sequential"}])
+
+        manager.publish_draft(confirmed=True)
+        program = self.api.programs()
+        selector = program["blocks"][-1]["items"][0]
+        self.assertEqual((int(selector["folder_id"]), selector["selection_mode"]), (folder_id, "sequential"))
+
+        occurrence_id = ProgrammingService(self.db).due(datetime(2026, 11, 16, 10, 15))[0]
+        selected = self.db.one("SELECT media_id,title,selection_folder_id,selection_mode,selected_at FROM program_occurrence_items WHERE occurrence_id=?", (occurrence_id,))
+        self.assertEqual((int(selected["media_id"]), selected["title"]), (first_id, "Alpha"))
+        self.assertEqual((int(selected["selection_folder_id"]), selected["selection_mode"]), (folder_id, "sequential"))
+        self.assertTrue(selected["selected_at"])
 
 
 if __name__ == "__main__":
