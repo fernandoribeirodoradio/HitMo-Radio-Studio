@@ -144,6 +144,13 @@ class MainWindow(QMainWindow):
         self._current_source_ref = None
         self._current_planned_for = ""
         self._muted = False
+        self._fixed_transition_target = None
+        self._fixed_transition_fade_ms = 1000
+        self._fixed_fade_timer_target = None
+        self._fixed_transition_due = False
+        self._fixed_transition_fade_done = False
+        self._fixed_transition_position_ms = None
+        self._fixed_transition_late = False
         self.db.execute("UPDATE playback_history SET status='interrupted',ended_at=CURRENT_TIMESTAMP WHERE status IN ('loading','playing','paused')")
         self.playlist.recover_interrupted()
         self.programming.recover_interrupted()
@@ -151,6 +158,9 @@ class MainWindow(QMainWindow):
         self.resize(1440, 900)
         self._build_ui()
         self._wire_audio()
+        self._fixed_transition_timer = QTimer(self)
+        self._fixed_transition_timer.setSingleShot(True)
+        self._fixed_transition_timer.timeout.connect(self._begin_fixed_transition_fade)
         self._refresh_operators()
         self._refresh_playlist()
         self._refresh_library()
@@ -442,6 +452,7 @@ class MainWindow(QMainWindow):
         self.engine.program_state.connect(self._playback_state)
         self.engine.program_position.connect(self._position_changed)
         self.engine.program_finished.connect(self._playback_finished)
+        self.engine.program_faded_out.connect(self._fixed_transition_faded_out)
         self.engine.program_error.connect(self._audio_error)
         self.engine.loop_error.connect(lambda message: self.statusBar().showMessage(f"Erro na trilha: {message}", 8000))
         self.engine.preview_error.connect(lambda message: self.statusBar().showMessage(f"Erro na pré-escuta: {message}", 8000))
@@ -971,8 +982,8 @@ class MainWindow(QMainWindow):
         self._current_source_ref = None
         self._current_planned_for = ""
 
-    def _end_current(self, status: str, error_message: str = ""):
-        self._finish_history(status, error_message)
+    def _end_current(self, status: str, error_message: str = "", played_ms: int | None = None):
+        self._finish_history(status, error_message, played_ms)
         if self._current_queue_id:
             self.playlist.set_status(self._current_queue_id, status)
             self._refresh_playlist()
@@ -1047,17 +1058,60 @@ class MainWindow(QMainWindow):
             )
         self._refresh_history()
 
-    def _finish_history(self, status: str = "completed", error_message: str = ""):
+    def _finish_history(self, status: str = "completed", error_message: str = "", played_ms: int | None = None):
         if self._history_id:
-            seconds = max(0.0, float(self.engine.program.position()) / 1000.0)
+            position_ms = self.engine.program.position() if played_ms is None else played_ms
+            seconds = max(0.0, float(position_ms) / 1000.0)
             self.db.execute("UPDATE playback_history SET ended_at=CURRENT_TIMESTAMP,played_seconds=?,status=?,error_message=? WHERE id=?", (seconds, status, error_message, self._history_id))
             self._history_id = None
             self._refresh_history()
 
+    def _fixed_transition_faded_out(self, played_ms: int):
+        self._fixed_transition_fade_done = True
+        self._fixed_transition_position_ms = int(played_ms)
+        if self._fixed_transition_due:
+            self._finish_fixed_transition()
+
+    def _begin_fixed_transition_fade(self):
+        self._fixed_fade_timer_target = None
+        target = self._fixed_transition_target
+        if target is None or not self._current or self._fixed_transition_due:
+            return
+        remaining_ms = int((target - datetime.now()).total_seconds() * 1000)
+        if remaining_ms <= 0:
+            self._fixed_transition_late = True
+            self.engine.fade_out_program(0)
+            return
+        self.engine.fade_out_program(min(self._fixed_transition_fade_ms, remaining_ms))
+
+    def _finish_fixed_transition(self, natural_end: bool = False):
+        if self._current and not natural_end:
+            target_text = self._fixed_transition_target.strftime("%Y-%m-%d %H:%M") if self._fixed_transition_target else "horário programado"
+            fade_ms = 0 if self._fixed_transition_late else self._fixed_transition_fade_ms
+            reason = f"Interrompido pela transição Fixo para bloco comercial em {target_text}; fade-out configurado: {fade_ms} ms."
+            if self._fixed_transition_late:
+                reason += " O corte foi imediato porque o limite foi detectado após o horário previsto."
+            self._end_current("interrupted", reason, self._fixed_transition_position_ms)
+        self._clear_current()
+        self._fixed_transition_timer.stop()
+        self._fixed_fade_timer_target = None
+        self._fixed_transition_target = None
+        self._fixed_transition_due = False
+        self._fixed_transition_fade_done = False
+        self._fixed_transition_position_ms = None
+        self._fixed_transition_late = False
+        self.now_title.setText("Transição de bloco concluída")
+        self.now_artist.setText("Programação comercial no horário fixo")
+        QTimer.singleShot(0, self._play_next_pending)
+
     def _playback_finished(self):
+        fixed_due = self._fixed_transition_due
         if self._current:
             self._end_current("completed")
         self._clear_current()
+        if fixed_due:
+            self._finish_fixed_transition(natural_end=True)
+            return
         self.now_title.setText("Faixa concluída")
         self.now_artist.setText("Pronto para a próxima inserção")
         if self.programming.next_occurrence_item() or self.db.setting("auto_advance", "1") == "1":
@@ -1067,10 +1121,14 @@ class MainWindow(QMainWindow):
         self._play_next_pending()
 
     def _audio_error(self, message):
+        fixed_due = self._fixed_transition_due
         if self._current:
             self._end_current("failed", message)
         self._clear_current()
         self.statusBar().showMessage(f"Falha ao reproduzir áudio: {message}", 10000)
+        if fixed_due:
+            self._finish_fixed_transition(natural_end=True)
+            return
         if self.programming.next_occurrence_item() or self.db.setting("auto_advance", "1") == "1":
             QTimer.singleShot(0, self._play_scheduled_or_next)
 
@@ -1166,9 +1224,48 @@ class MainWindow(QMainWindow):
         self.db.execute("DELETE FROM timeline_events WHERE id=?", (event_id,))
         self._refresh_timeline()
 
-    def _tick(self):
-        now = datetime.now()
+    def _schedule_fixed_transition(self, now: datetime):
+        upcoming = self.programming.next_fixed_transition(now)
+        if upcoming is None:
+            if (
+                self._fixed_transition_target is not None
+                and now.strftime("%Y-%m-%d %H:%M") == self._fixed_transition_target.strftime("%Y-%m-%d %H:%M")
+            ):
+                # Preserve a fade that reaches its boundary before the 500 ms
+                # programming tick materializes that minute's occurrence.
+                return
+            if not self._fixed_transition_due:
+                self._fixed_transition_timer.stop()
+                if self.engine.program_fade_active:
+                    self.engine.cancel_program_fade()
+                self._fixed_transition_target = None
+                self._fixed_fade_timer_target = None
+                self._fixed_transition_fade_done = False
+            return
+        target = upcoming["at"]
+        if target != self._fixed_transition_target:
+            self._fixed_transition_timer.stop()
+            if self.engine.program_fade_active:
+                self.engine.cancel_program_fade()
+            self._fixed_transition_target = target
+            self._fixed_transition_fade_ms = int(upcoming["fade_ms"])
+            self._fixed_fade_timer_target = None
+            self._fixed_transition_fade_done = False
+            self._fixed_transition_late = False
+        if not self._current or self._fixed_transition_due or self.engine.program_fade_active:
+            return
+        remaining_ms = int((target - now).total_seconds() * 1000)
+        if remaining_ms <= 0:
+            return
+        if self._fixed_fade_timer_target == target and self._fixed_transition_timer.isActive():
+            return
+        self._fixed_fade_timer_target = target
+        self._fixed_transition_timer.start(max(0, remaining_ms - self._fixed_transition_fade_ms))
+
+    def _tick(self, now: datetime | None = None):
+        now = now or datetime.now()
         self.clock_label.setText(now.strftime("%H:%M:%S"))
+        self._schedule_fixed_transition(now)
         due = self.programming.due(now)
         if due:
             pending_items = self.db.one(
@@ -1178,6 +1275,30 @@ class MainWindow(QMainWindow):
                 f"Programação agendada · {len(due)} ocorrência(s) persistida(s) · {pending_items} inserção(ões) pendente(s)",
                 8000,
             )
+            placeholders = ",".join("?" for _ in due)
+            fixed_occurrence = self.db.one(
+                f"SELECT scheduled_for,fixed_fade_ms FROM program_occurrences "
+                f"WHERE id IN ({placeholders}) AND origin_type='block' AND transition_policy='fixed' "
+                "ORDER BY scheduled_for,id LIMIT 1",
+                tuple(due),
+            )
+            if fixed_occurrence:
+                self._fixed_transition_due = True
+                self._fixed_transition_target = datetime.strptime(fixed_occurrence["scheduled_for"], "%Y-%m-%d %H:%M")
+                self._fixed_transition_fade_ms = int(fixed_occurrence["fixed_fade_ms"])
+                if self._current:
+                    if self._fixed_transition_fade_done:
+                        self._finish_fixed_transition()
+                    elif not self.engine.program_fade_active:
+                        # If the application woke after the boundary, don't delay
+                        # the fixed commercial further; preserve the late-cut reason.
+                        self._fixed_transition_late = True
+                        self.engine.fade_out_program(0)
+                else:
+                    self._finish_fixed_transition(natural_end=True)
+                self._refresh_timeline()
+                self._refresh_program_blocks()
+                return
             # A due occurrence is prepared in SQLite immediately, but PGM changes
             # source only when no item is active. Natural end/error advances it.
             if not self._current:
@@ -1211,7 +1332,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Histórico exportado: {path}", 7000)
 
     def closeEvent(self, event):
-        for timer_name in ("_timer", "_catalog_poll", "_api_poll"):
+        for timer_name in ("_timer", "_catalog_poll", "_api_poll", "_fixed_transition_timer"):
             timer = getattr(self, timer_name, None)
             if timer is not None:
                 timer.stop()

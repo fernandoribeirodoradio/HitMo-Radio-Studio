@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt, QTime
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
     QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QTabWidget,
+    QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget,
     QTimeEdit, QVBoxLayout, QWidget,
 )
 
@@ -30,6 +30,14 @@ class BlockDialog(QDialog):
         self.block_type.addItems(("Música", "Comercial"))
         if record:
             self.block_type.setCurrentText(record["block_type"])
+        self.transition_policy = QComboBox()
+        self.fixed_fade_ms = QSpinBox()
+        self.fixed_fade_ms.setRange(0, 5000)
+        self.fixed_fade_ms.setSuffix(" ms")
+        self.fixed_fade_ms.setToolTip("Duração do fade-out do bloco Fixo. Zero significa corte imediato (opção própria do HitMo).")
+        self.fixed_fade_ms.setValue(int(record.get("fixed_fade_ms", 1000)) if record else 1000)
+        self._refresh_transition_policy(record.get("transition_policy", "discard_insertions") if record else "discard_insertions")
+        self.block_type.currentTextChanged.connect(self._refresh_transition_policy)
         self.time = QTimeEdit()
         self.time.setDisplayFormat("HH:mm")
         if record:
@@ -48,6 +56,8 @@ class BlockDialog(QDialog):
         form.addRow("Nome do bloco", self.name)
         form.addRow("Tipo", self.block_type)
         form.addRow("Horário de início", self.time)
+        form.addRow("Mudança de bloco", self.transition_policy)
+        form.addRow("Redução do áudio Fixo", self.fixed_fade_ms)
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(QLabel("Dias de recorrência"))
@@ -56,6 +66,22 @@ class BlockDialog(QDialog):
         buttons.accepted.connect(self._validate)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _refresh_transition_policy(self, requested: str | None = None):
+        if requested is None:
+            requested = str(self.transition_policy.currentData() or "discard_insertions")
+        self.transition_policy.clear()
+        self.transition_policy.addItem("Descartar inserções", "discard_insertions")
+        if self.block_type.currentText() == "Comercial":
+            self.transition_policy.addItem("Fixo · transição no horário", "fixed")
+        index = self.transition_policy.findData(requested)
+        self.transition_policy.setCurrentIndex(max(0, index))
+        is_fixed = self.transition_policy.currentData() == "fixed"
+        self.fixed_fade_ms.setEnabled(is_fixed)
+        self.fixed_fade_ms.setToolTip(
+            "Duração do fade-out do Fixo. Zero significa corte imediato, opção própria do HitMo; o manual descreve fade-out, sem fixar duração."
+            if is_fixed else "Usado quando o bloco comercial está configurado como Fixo."
+        )
 
     def _validate(self):
         if not self.name.text().strip():
@@ -73,6 +99,8 @@ class BlockDialog(QDialog):
             "time_of_day": self.time.time().toString("HH:mm"),
             "days": [index for index, day in enumerate(self.days) if day.isChecked()],
             "enabled": bool(self.record.get("enabled", True)) if self.record else True,
+            "transition_policy": str(self.transition_policy.currentData()),
+            "fixed_fade_ms": self.fixed_fade_ms.value(),
         }
 
 
@@ -132,7 +160,7 @@ class ProgrammingManagerWindow(QMainWindow):
         draft_row.addWidget(self.draft_selector, 1)
         draft_row.addWidget(self.load_published_button)
         editor_layout.addLayout(draft_row)
-        self.blocks_table = self._table(["Estado", "Hora", "Bloco", "Tipo", "Dias", "Itens"])
+        self.blocks_table = self._table(["Estado", "Hora", "Bloco", "Tipo", "Transição", "Dias", "Itens"])
         self.blocks_table.itemSelectionChanged.connect(self._render_items)
         editor_layout.addWidget(self.blocks_table, 1)
         block_actions = QHBoxLayout()
@@ -287,6 +315,8 @@ class ProgrammingManagerWindow(QMainWindow):
                 "time_of_day": str(source.get("time_of_day", "00:00")),
                 "days": day_values,
                 "enabled": bool(source.get("enabled", True)),
+                "transition_policy": str(source.get("transition_policy", "discard_insertions")),
+                "fixed_fade_ms": int(source.get("fixed_fade_ms", 1000)),
                 "items": [
                     ({"folder_id": int(item["folder_id"]), "selection_mode": str(item.get("selection_mode", "random"))}
                      if isinstance(item, dict) and item.get("folder_id") is not None
@@ -299,7 +329,17 @@ class ProgrammingManagerWindow(QMainWindow):
 
     @staticmethod
     def _payload(blocks: list[dict]) -> list[dict]:
-        return [{key: copy.deepcopy(block[key]) for key in ("id", "name", "block_type", "time_of_day", "days", "enabled", "items")} for block in blocks]
+        return [
+            {
+                key: copy.deepcopy(block.get(key, default))
+                for key, default in (
+                    ("id", None), ("name", ""), ("block_type", "Música"),
+                    ("time_of_day", "00:00"), ("days", []), ("enabled", True),
+                    ("transition_policy", "discard_insertions"), ("fixed_fade_ms", 1000), ("items", []),
+                )
+            }
+            for block in blocks
+        ]
 
     def _load_working(self, blocks: list[dict], draft: dict | None, label: str):
         self.blocks = copy.deepcopy(blocks)
@@ -367,7 +407,8 @@ class ProgrammingManagerWindow(QMainWindow):
             self.blocks_table.insertRow(row)
             labels = (
                 "Ativo" if block["enabled"] else "Pausado", block["time_of_day"], block["name"],
-                block["block_type"], ", ".join(DAY_NAMES[day] for day in block["days"] if 0 <= day < 7),
+                block["block_type"], "Fixo" if block["transition_policy"] == "fixed" else "Descartar excedentes",
+                ", ".join(DAY_NAMES[day] for day in block["days"] if 0 <= day < 7),
                 str(len(block["items"])),
             )
             for column, label in enumerate(labels):
@@ -443,7 +484,8 @@ class ProgrammingManagerWindow(QMainWindow):
         self._update_actions()
 
     def add_block_data(self, values: dict):
-        self.blocks.append({"id": None, **copy.deepcopy(values), "items": []})
+        block = {"id": None, "transition_policy": "discard_insertions", "fixed_fade_ms": 1000, **copy.deepcopy(values), "items": []}
+        self.blocks.append(block)
         self._changed()
         self._render_blocks()
         self.blocks_table.selectRow(len(self.blocks) - 1)
@@ -500,7 +542,7 @@ class ProgrammingManagerWindow(QMainWindow):
         index = self._selected_block_index()
         if index is None:
             return
-        values = {key: self.blocks[index][key] for key in ("name", "block_type", "time_of_day", "days")}
+        values = {key: self.blocks[index][key] for key in ("name", "block_type", "time_of_day", "days", "transition_policy", "fixed_fade_ms")}
         values["enabled"] = not self.blocks[index]["enabled"]
         self.update_block_data(index, values)
 

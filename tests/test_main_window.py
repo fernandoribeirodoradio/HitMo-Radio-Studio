@@ -174,6 +174,59 @@ class MainWindowIntegrationTests(unittest.TestCase):
     def test_new_scheduled_block_waits_for_current_commercial_to_finish(self):
         self._scheduled_transition_does_not_cut_current_item("Comercial")
 
+    def test_fixed_transition_fades_current_program_and_records_interruption_reason(self):
+        if not QMediaDevices.audioOutputs():
+            self.skipTest("Nenhuma saída de áudio disponível para executar o WAV de teste.")
+        previous_data_dir = os.environ.get("HITMO_DATA_DIR")
+        with tempfile.TemporaryDirectory() as temp:
+            os.environ["HITMO_DATA_DIR"] = temp
+            current_path = self._write_test_audio(Path(temp) / "current-fixed.wav", 2.0)
+            window = MainWindow()
+            try:
+                window.db.set_setting("auto_advance", "0")
+                window.library.import_paths([current_path], category="Música")
+                current = window.db.one("SELECT * FROM media WHERE path=?", (str(current_path.resolve()),))
+                block_id = window.programming.add_block("Música no ar", "Música", "12:00", [6])
+                occurrence_id = window.db.execute(
+                    "INSERT INTO program_occurrences(origin_type,block_id,scheduled_for,status) VALUES('block',?,'2026-11-15 12:00','running')",
+                    (block_id,),
+                )
+                occurrence_item_id = window.db.execute(
+                    "INSERT INTO program_occurrence_items(occurrence_id,media_id,position,title,path,category,status) VALUES(?,?,0,?,?,?,'playing')",
+                    (occurrence_id, int(current["id"]), current["title"], current["path"], current["category"]),
+                )
+                self.assertTrue(window._play_media(
+                    current, source_type="scheduled_block", source_ref=occurrence_item_id,
+                    occurrence_item_id=occurrence_item_id, scheduled_for="2026-11-15 12:00",
+                ))
+                self.assertTrue(self._wait_until(lambda: window.engine.program.position() > 0))
+                window._fixed_transition_due = True
+                window._fixed_transition_target = datetime(2026, 11, 15, 12, 1)
+                window._fixed_transition_fade_ms = 150
+                window.engine.fade_out_program(150)
+                self.assertTrue(self._wait_until(
+                    lambda: window.db.one("SELECT status FROM playback_history WHERE title=?", (current["title"],))["status"] == "interrupted"
+                ))
+                history = window.db.one(
+                    "SELECT played_seconds,error_message FROM playback_history WHERE title=?", (current["title"],)
+                )
+                item = window.db.one("SELECT status,error_message FROM program_occurrence_items WHERE id=?", (occurrence_item_id,))
+                self.assertGreater(float(history["played_seconds"]), 0)
+                self.assertIn("Fixo", history["error_message"])
+                self.assertEqual(item["status"], "interrupted")
+                self.assertIn("Fixo", item["error_message"])
+            finally:
+                window.engine.stop_program()
+                window.engine.eject_program()
+                self._wait_until(lambda: window.engine.program.mediaStatus() == QMediaPlayer.MediaStatus.NoMedia, 2000)
+                window.close()
+                window.deleteLater()
+                self.app.processEvents()
+        if previous_data_dir is None:
+            os.environ.pop("HITMO_DATA_DIR", None)
+        else:
+            os.environ["HITMO_DATA_DIR"] = previous_data_dir
+
     def test_missing_scheduled_file_is_recorded_failed_once(self):
         previous_data_dir = os.environ.get("HITMO_DATA_DIR")
         with tempfile.TemporaryDirectory() as temp:

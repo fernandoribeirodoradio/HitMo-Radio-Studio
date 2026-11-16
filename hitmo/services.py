@@ -4,7 +4,7 @@ import re
 import json
 import random
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -250,7 +250,10 @@ class ProgrammingService:
         self.db = db
         self.rng = rng or random.Random()
 
-    def add_block(self, name: str, block_type: str, time_of_day: str, days: list[int]) -> int:
+    def add_block(
+        self, name: str, block_type: str, time_of_day: str, days: list[int],
+        transition_policy: str = "discard_insertions", fixed_fade_ms: int = 1000,
+    ) -> int:
         if block_type not in {"Música", "Comercial"}:
             raise ValueError("O bloco deve ser musical ou comercial.")
         if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", time_of_day):
@@ -259,9 +262,15 @@ class ProgrammingService:
             raise ValueError("Selecione dias válidos da semana.")
         if not name.strip():
             raise ValueError("Informe um nome para o bloco.")
+        if transition_policy not in {"discard_insertions", "fixed"}:
+            raise ValueError("Política de transição inválida.")
+        if transition_policy == "fixed" and block_type != "Comercial":
+            raise ValueError("A transição Fixo só pode ser configurada em bloco comercial.")
+        if type(fixed_fade_ms) is not int or not 0 <= fixed_fade_ms <= 5000:
+            raise ValueError("O fade do bloco Fixo deve estar entre 0 e 5000 ms.")
         return self.db.execute(
-            "INSERT INTO program_blocks(name,block_type,time_of_day,days) VALUES(?,?,?,?)",
-            (name.strip(), block_type, time_of_day, ",".join(map(str, sorted(set(days))))),
+            "INSERT INTO program_blocks(name,block_type,time_of_day,days,transition_policy,fixed_fade_ms) VALUES(?,?,?,?,?,?)",
+            (name.strip(), block_type, time_of_day, ",".join(map(str, sorted(set(days)))), transition_policy, fixed_fade_ms),
         )
 
     def blocks(self):
@@ -470,11 +479,34 @@ class ProgrammingService:
     def set_block_enabled(self, block_id: int, enabled: bool) -> None:
         self.db.execute("UPDATE program_blocks SET enabled=? WHERE id=?", (int(enabled), block_id))
 
+    def next_fixed_transition(self, now: datetime):
+        """Return the next enabled commercial Fixo boundary after ``now``."""
+        rows = self.db.all(
+            "SELECT id,time_of_day,days,fixed_fade_ms FROM program_blocks "
+            "WHERE enabled=1 AND block_type='Comercial' AND transition_policy='fixed' "
+            "AND EXISTS (SELECT 1 FROM program_block_items i WHERE i.block_id=program_blocks.id)"
+        )
+        candidates = []
+        for offset in range(8):
+            day = now.date() + timedelta(days=offset)
+            for row in rows:
+                days = {int(value) for value in str(row["days"]).split(",") if value.strip().isdigit()}
+                if day.weekday() not in days:
+                    continue
+                target = datetime.combine(day, datetime.strptime(row["time_of_day"], "%H:%M").time())
+                if target > now:
+                    fade_ms = max(0, min(5000, int(row["fixed_fade_ms"])))
+                    candidates.append((target, int(row["id"]), fade_ms))
+        if not candidates:
+            return None
+        target, block_id, fade_ms = min(candidates)
+        return {"at": target, "block_id": block_id, "fade_ms": fade_ms}
+
     def due(self, now: datetime):
         scheduled_for = now.strftime("%Y-%m-%d %H:%M")
         weekday = now.weekday()
         created: list[int] = []
-        created_block = False
+        created_blocks: list[sqlite3.Row] = []
         with self.db.connect() as con:
             program_revision = int(con.execute("SELECT revision FROM program_state WHERE id=1").fetchone()["revision"])
             blocks = con.execute("SELECT * FROM program_blocks WHERE enabled=1 AND time_of_day=?", (now.strftime("%H:%M"),)).fetchall()
@@ -491,13 +523,14 @@ class ProgrammingService:
                 if not items:
                     continue
                 cursor = con.execute(
-                    "INSERT OR IGNORE INTO program_occurrences(origin_type,block_id,scheduled_for,status,program_revision_id) VALUES('block',?,?,'planned',?)",
-                    (int(block["id"]), scheduled_for, program_revision),
+                    "INSERT OR IGNORE INTO program_occurrences(origin_type,block_id,scheduled_for,status,program_revision_id,transition_policy,fixed_fade_ms) "
+                    "VALUES('block',?,?,'planned',?,?,?)",
+                    (int(block["id"]), scheduled_for, program_revision, block["transition_policy"], block["fixed_fade_ms"]),
                 )
                 if cursor.rowcount:
                     occurrence_id = int(cursor.lastrowid)
                     created.append(occurrence_id)
-                    created_block = True
+                    created_blocks.append(block)
                     # Folder selections avoid tracks explicitly fixed elsewhere
                     # in this block and choices already materialized for it.
                     selected_ids = {int(row["media_id"]) for row in items if row["media_id"] is not None}
@@ -550,17 +583,21 @@ class ProgrammingService:
                         (occurrence_id,),
                     ).fetchone():
                         con.execute("UPDATE program_occurrences SET status='failed' WHERE id=?", (occurrence_id,))
-            if created_block:
+            if created_blocks:
                 # The next scheduled block is the documented cutoff. Never stop
                 # an item already loading/playing; discard only remaining inserts
                 # from older block occurrences, leaving their audit snapshots.
+                fixed_transition = any(block["transition_policy"] == "fixed" for block in created_blocks)
+                reason = (
+                    "Inserção excedente descartada no horário do bloco Fixo seguinte"
+                    if fixed_transition else "Inserção excedente descartada no horário do próximo bloco"
+                )
                 con.execute(
                     "UPDATE program_occurrence_items "
-                    "SET status='skipped',ended_at=CURRENT_TIMESTAMP,"
-                    "error_message='Inserção excedente descartada no horário do próximo bloco' "
+                    "SET status='discarded',ended_at=CURRENT_TIMESTAMP,error_message=? "
                     "WHERE status='planned' AND occurrence_id IN ("
                     "SELECT id FROM program_occurrences WHERE origin_type='block' AND scheduled_for<?)",
-                    (scheduled_for,),
+                    (reason, scheduled_for),
                 )
                 con.execute(
                     "UPDATE program_occurrences SET status='interrupted' "
@@ -596,12 +633,12 @@ class ProgrammingService:
         )
 
     def set_occurrence_item_status(self, item_id: int, status: str, error_message: str = "") -> None:
-        allowed = {"planned", "loading", "playing", "paused", "completed", "skipped", "stopped", "failed", "ejected", "interrupted"}
+        allowed = {"planned", "loading", "playing", "paused", "completed", "skipped", "discarded", "stopped", "failed", "ejected", "interrupted"}
         if status not in allowed:
             raise ValueError(f"Estado de ocorrência inválido: {status}")
         with self.db.connect() as con:
             con.execute(
-                "UPDATE program_occurrence_items SET status=?,error_message=?,started_at=CASE WHEN ?='playing' AND started_at='' THEN CURRENT_TIMESTAMP ELSE started_at END,ended_at=CASE WHEN ? IN ('completed','skipped','stopped','failed','interrupted') THEN CURRENT_TIMESTAMP ELSE ended_at END WHERE id=?",
+                "UPDATE program_occurrence_items SET status=?,error_message=?,started_at=CASE WHEN ?='playing' AND started_at='' THEN CURRENT_TIMESTAMP ELSE started_at END,ended_at=CASE WHEN ? IN ('completed','skipped','discarded','stopped','failed','interrupted') THEN CURRENT_TIMESTAMP ELSE ended_at END WHERE id=?",
                 (status, error_message, status, status, item_id),
             )
             occurrence_id = con.execute("SELECT occurrence_id FROM program_occurrence_items WHERE id=?", (item_id,)).fetchone()
@@ -609,7 +646,7 @@ class ProgrammingService:
                 if status == "interrupted":
                     con.execute("UPDATE program_occurrences SET status='interrupted' WHERE id=?", (occurrence_id["occurrence_id"],))
                     return
-                pending = con.execute("SELECT 1 FROM program_occurrence_items WHERE occurrence_id=? AND status NOT IN ('completed','skipped','stopped','failed','interrupted') LIMIT 1", (occurrence_id["occurrence_id"],)).fetchone()
+                pending = con.execute("SELECT 1 FROM program_occurrence_items WHERE occurrence_id=? AND status NOT IN ('completed','skipped','discarded','stopped','failed','interrupted') LIMIT 1", (occurrence_id["occurrence_id"],)).fetchone()
                 if pending:
                     con.execute("UPDATE program_occurrences SET status='running' WHERE id=?", (occurrence_id["occurrence_id"],))
                 else:

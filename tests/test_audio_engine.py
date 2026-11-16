@@ -104,6 +104,50 @@ class AudioEngineSmokeTests(unittest.TestCase):
             self.app.processEvents()
             engine = None
 
+    def test_program_fade_out_reports_position_and_restores_output_volume(self):
+        if not QMediaDevices.audioOutputs():
+            self.skipTest("Nenhuma saída de áudio disponível neste computador.")
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "fade.wav"
+            with wave.open(str(path), "wb") as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(8000)
+                stream.writeframes(b"\x00\x00" * 24000)
+            engine = AudioEngine()
+            ended = []
+            volumes = []
+            engine.program_faded_out.connect(ended.append)
+            engine.program_output.volumeChanged.connect(volumes.append)
+            engine.play_program(str(path))
+            self.assertTrue(self._wait_until(lambda: engine.program.playbackState() == QMediaPlayer.PlaybackState.PlayingState))
+            self.assertTrue(self._wait_until(lambda: engine.program.position() > 0))
+            initial_volume = engine.program_output.volume()
+            engine.fade_out_program(150)
+            self.assertTrue(self._wait_until(lambda: bool(ended)))
+            self.assertEqual(engine.program.playbackState(), QMediaPlayer.PlaybackState.StoppedState)
+            self.assertGreater(ended[0], 0)
+            self.assertTrue(any(0 < volume < initial_volume for volume in volumes))
+            self.assertAlmostEqual(engine.program_output.volume(), initial_volume)
+            engine.eject_program()
+            self._wait_until(lambda: engine.program.mediaStatus() == QMediaPlayer.MediaStatus.NoMedia)
+            engine.deleteLater()
+            self.app.processEvents()
+
+    @staticmethod
+    def _wait_until(predicate, timeout_ms=3000):
+        if predicate():
+            return True
+        loop = QEventLoop()
+        poll = QTimer()
+        poll.setInterval(10)
+        poll.timeout.connect(lambda: loop.quit() if predicate() else None)
+        poll.start()
+        QTimer.singleShot(timeout_ms, loop.quit)
+        loop.exec()
+        poll.stop()
+        return bool(predicate())
+
 
 if __name__ == "__main__":
     unittest.main()

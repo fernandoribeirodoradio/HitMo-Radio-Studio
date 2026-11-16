@@ -136,6 +136,11 @@ class PlaylistCompatibilityTests(unittest.TestCase):
         self.assertIn("text_content", {row["name"] for row in migrated.all("PRAGMA table_info(media)")})
         self.assertIn("status", {row["name"] for row in migrated.all("PRAGMA table_info(playlist_items)")})
         self.assertIn("duration", {row["name"] for row in migrated.all("PRAGMA table_info(program_occurrence_items)")})
+        self.assertIn("transition_policy", {row["name"] for row in migrated.all("PRAGMA table_info(program_blocks)")})
+        self.assertIn("fixed_fade_ms", {row["name"] for row in migrated.all("PRAGMA table_info(program_blocks)")})
+        occurrence_columns = {row["name"] for row in migrated.all("PRAGMA table_info(program_occurrences)")}
+        self.assertIn("transition_policy", occurrence_columns)
+        self.assertIn("fixed_fade_ms", occurrence_columns)
         folder_columns = {row["name"] for row in migrated.all("PRAGMA table_info(media_folders)")}
         self.assertIn("jingle_rotation_enabled", folder_columns)
         self.assertIn("jingle_repeat_cooldown", folder_columns)

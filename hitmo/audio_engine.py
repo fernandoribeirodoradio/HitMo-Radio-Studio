@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, QUrl, Signal
+import time
+
+from PySide6.QtCore import QObject, QTimer, QUrl, Signal
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 
 
@@ -17,6 +19,7 @@ class AudioEngine(QObject):
     preview_error = Signal(str)
     loop_error = Signal(str)
     program_finished = Signal()
+    program_faded_out = Signal(int)
     preview_finished = Signal()
 
     def __init__(self, output_id: str = ""):
@@ -26,6 +29,12 @@ class AudioEngine(QObject):
         self.program = QMediaPlayer(self)
         self.preview = QMediaPlayer(self)
         self._loop_players: dict[str, tuple[QMediaPlayer, QAudioOutput]] = {}
+        self._program_fade_started = 0.0
+        self._program_fade_duration_ms = 0
+        self._program_fade_start_volume = 1.0
+        self._program_fade_timer = QTimer(self)
+        self._program_fade_timer.setInterval(15)
+        self._program_fade_timer.timeout.connect(self._advance_program_fade)
         for player, output in ((self.program, self.program_output), (self.preview, self.preview_output)):
             player.setAudioOutput(output)
             player.errorOccurred.connect(lambda _error, text, p=player: self._error(p, text))
@@ -39,6 +48,7 @@ class AudioEngine(QObject):
 
     def _error(self, player: QMediaPlayer, message: str) -> None:
         if player is self.program:
+            self.cancel_program_fade()
             signal = self.program_error
         elif player is self.preview:
             signal = self.preview_error
@@ -48,6 +58,7 @@ class AudioEngine(QObject):
 
     def _program_media_status(self, status) -> None:
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self.cancel_program_fade()
             self.program_finished.emit()
             self.program.setSource(QUrl())
 
@@ -64,6 +75,7 @@ class AudioEngine(QObject):
             player.play()
 
     def play_program(self, path: str) -> None:
+        self.cancel_program_fade()
         self._load(self.program, path)
 
     def toggle_program(self) -> None:
@@ -80,11 +92,48 @@ class AudioEngine(QObject):
             self.program.play()
 
     def stop_program(self) -> None:
+        self.cancel_program_fade()
         self.program.stop()
 
     def eject_program(self) -> None:
+        self.cancel_program_fade()
         self.program.stop()
         self.program.setSource(QUrl())
+
+    @property
+    def program_fade_active(self) -> bool:
+        return self._program_fade_timer.isActive()
+
+    def fade_out_program(self, duration_ms: int) -> None:
+        """Reduce PGM output, then stop it; zero milliseconds is an immediate cut."""
+        self.cancel_program_fade()
+        duration_ms = max(0, int(duration_ms))
+        if duration_ms == 0:
+            position = self.program.position()
+            self.program.stop()
+            self.program_faded_out.emit(position)
+            return
+        self._program_fade_duration_ms = duration_ms
+        self._program_fade_started = time.monotonic()
+        self._program_fade_start_volume = self.program_output.volume()
+        self._program_fade_timer.start()
+
+    def _advance_program_fade(self) -> None:
+        elapsed_ms = (time.monotonic() - self._program_fade_started) * 1000
+        ratio = min(1.0, elapsed_ms / self._program_fade_duration_ms)
+        self.program_output.setVolume(self._program_fade_start_volume * (1.0 - ratio))
+        if ratio < 1.0:
+            return
+        position = self.program.position()
+        self._program_fade_timer.stop()
+        self.program.stop()
+        self.program_output.setVolume(self._program_fade_start_volume)
+        self.program_faded_out.emit(position)
+
+    def cancel_program_fade(self) -> None:
+        if self._program_fade_timer.isActive():
+            self._program_fade_timer.stop()
+            self.program_output.setVolume(self._program_fade_start_volume)
 
     def set_muted(self, muted: bool) -> None:
         self.program_output.setMuted(muted)

@@ -200,6 +200,26 @@ class ProgrammingManagerIntegrationTests(unittest.TestCase):
         self.assertEqual((int(selected["selection_folder_id"]), selected["selection_mode"]), (folder_id, "sequential"))
         self.assertTrue(selected["selected_at"])
 
+    def test_remote_fixed_policy_is_published_and_copied_to_the_occurrence(self):
+        manager = ProgrammingManagerWindow(self.api, self.identity)
+        self.windows.append(manager)
+        manager.add_block_data({
+            "name": "Comercial pontual", "block_type": "Comercial", "time_of_day": "10:25",
+            "days": [0], "enabled": True, "transition_policy": "fixed", "fixed_fade_ms": 0,
+        })
+        manager.blocks_table.selectRow(len(manager.blocks) - 1)
+        manager.add_material_to_block(self.commercial_id)
+        manager.save_draft("Fixo remoto")
+        manager.publish_draft(confirmed=True)
+
+        published = next(block for block in self.api.programs()["blocks"] if block["name"] == "Comercial pontual")
+        self.assertEqual((published["transition_policy"], published["fixed_fade_ms"]), ("fixed", 0))
+        occurrence_id = ProgrammingService(self.db).due(datetime(2026, 11, 16, 10, 25))[0]
+        occurrence = self.db.one(
+            "SELECT transition_policy,fixed_fade_ms FROM program_occurrences WHERE id=?", (occurrence_id,)
+        )
+        self.assertEqual((occurrence["transition_policy"], occurrence["fixed_fade_ms"]), ("fixed", 0))
+
     def test_remote_programming_publishes_jingle_rotation_and_records_selection_without_air_history(self):
         folder_path = self.root / "jingle-rotation-folder"
         folder_path.mkdir()

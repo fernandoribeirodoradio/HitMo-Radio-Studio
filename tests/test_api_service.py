@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.request import urlopen
 
 from hitmo.api_client import HitMoAPIClient
-from hitmo.api_service import create_api_user, create_server
+from hitmo.api_service import APIError, create_api_user, create_server, validate_program_payload
 from hitmo.database import Database
 from hitmo.services import ProgrammingService
 
@@ -100,6 +100,21 @@ class CentralAPIProcessTests(unittest.TestCase):
         self.assertIn("categories", self.reader.categories())
         with self.assertRaisesRegex(RuntimeError, "403"):
             self.reader.add_material(self._material("forbidden.wav"), self.reader.version()["catalog_revision"])
+
+    def test_fixed_transition_is_commercial_only_and_legacy_policy_defaults_to_discard(self):
+        common = {"name": "Bloco", "time_of_day": "12:30", "days": [0], "items": []}
+        fixed = validate_program_payload(
+            self.db,
+            {"blocks": [{**common, "block_type": "Comercial", "transition_policy": "fixed", "fixed_fade_ms": 250}]},
+        )["blocks"][0]
+        self.assertEqual((fixed["transition_policy"], fixed["fixed_fade_ms"]), ("fixed", 250))
+        with self.assertRaises(APIError):
+            validate_program_payload(
+                self.db,
+                {"blocks": [{**common, "block_type": "Música", "transition_policy": "fixed"}]},
+            )
+        legacy = validate_program_payload(self.db, {"blocks": [{**common, "block_type": "Música"}]})["blocks"][0]
+        self.assertEqual((legacy["transition_policy"], legacy["fixed_fade_ms"]), ("discard_insertions", 1000))
 
     def test_material_create_update_soft_deactivate_restore_and_history_preservation(self):
         audio = self._write_audio("original.wav")

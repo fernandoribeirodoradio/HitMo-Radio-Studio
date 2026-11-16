@@ -131,6 +131,17 @@ def validate_program_payload(db: Database, value: Any) -> dict[str, Any]:
             raise APIError(422, f"Bloco {index}: nome obrigatório (até 200 caracteres).")
         if block_type not in {"Música", "Comercial"}:
             raise APIError(422, f"Bloco {index}: block_type deve ser Música ou Comercial.")
+        transition_policy = source.get("transition_policy", "discard_insertions")
+        if transition_policy not in {"discard_insertions", "fixed"}:
+            raise APIError(422, f"Bloco {index}: política de transição inválida.")
+        if transition_policy == "fixed" and block_type != "Comercial":
+            raise APIError(422, f"Bloco {index}: Fixo só pode ser usado em bloco comercial, conforme o Playlist Digital.")
+        try:
+            fixed_fade_ms = int(source.get("fixed_fade_ms", 1000))
+        except (TypeError, ValueError) as exc:
+            raise APIError(422, f"Bloco {index}: fixed_fade_ms deve ser um inteiro entre 0 e 5000.") from exc
+        if not 0 <= fixed_fade_ms <= 5000:
+            raise APIError(422, f"Bloco {index}: fixed_fade_ms deve ser um inteiro entre 0 e 5000.")
         if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", time_of_day):
             raise APIError(422, f"Bloco {index}: horário inválido, use HH:MM.")
         days = _parse_days(source.get("days"))
@@ -197,6 +208,8 @@ def validate_program_payload(db: Database, value: Any) -> dict[str, Any]:
             "time_of_day": time_of_day,
             "days": days,
             "enabled": bool(source.get("enabled", True)),
+            "transition_policy": transition_policy,
+            "fixed_fade_ms": fixed_fade_ms,
             "items": normalized_items,
         })
     return {"blocks": blocks}
@@ -944,14 +957,24 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
             saved_ids = []
             for block in payload["blocks"]:
                 block_id = block.get("id")
-                values = (block["name"], block["block_type"], block["time_of_day"], ",".join(str(day) for day in block["days"]), int(block["enabled"]))
+                values = (
+                    block["name"], block["block_type"], block["time_of_day"],
+                    ",".join(str(day) for day in block["days"]), int(block["enabled"]),
+                    block["transition_policy"], block["fixed_fade_ms"],
+                )
                 if block_id is not None:
                     if int(block_id) not in existing:
                         raise APIError(409, f"O bloco {block_id} não existe mais.")
-                    con.execute("UPDATE program_blocks SET name=?,block_type=?,time_of_day=?,days=?,enabled=? WHERE id=?", (*values, int(block_id)))
+                    con.execute(
+                        "UPDATE program_blocks SET name=?,block_type=?,time_of_day=?,days=?,enabled=?,transition_policy=?,fixed_fade_ms=? WHERE id=?",
+                        (*values, int(block_id)),
+                    )
                     ident = int(block_id)
                 else:
-                    cur = con.execute("INSERT INTO program_blocks(name,block_type,time_of_day,days,enabled) VALUES(?,?,?,?,?)", values)
+                    cur = con.execute(
+                        "INSERT INTO program_blocks(name,block_type,time_of_day,days,enabled,transition_policy,fixed_fade_ms) VALUES(?,?,?,?,?,?,?)",
+                        values,
+                    )
                     ident = int(cur.lastrowid)
                 saved_ids.append(ident)
                 con.execute("DELETE FROM program_block_items WHERE block_id=?", (ident,))

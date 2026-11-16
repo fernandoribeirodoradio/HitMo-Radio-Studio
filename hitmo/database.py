@@ -171,7 +171,11 @@ class Database:
                     id INTEGER PRIMARY KEY, name TEXT NOT NULL,
                     block_type TEXT NOT NULL CHECK(block_type IN ('Música','Comercial')),
                     time_of_day TEXT NOT NULL, days TEXT NOT NULL DEFAULT '0,1,2,3,4,5,6',
-                    enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    transition_policy TEXT NOT NULL DEFAULT 'discard_insertions'
+                        CHECK(transition_policy IN ('discard_insertions','fixed')),
+                    fixed_fade_ms INTEGER NOT NULL DEFAULT 1000 CHECK(fixed_fade_ms BETWEEN 0 AND 5000),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS idx_program_blocks_time ON program_blocks(enabled,time_of_day);
                 CREATE TABLE IF NOT EXISTS program_block_items (
@@ -195,6 +199,8 @@ class Database:
                     block_id INTEGER, timeline_event_id INTEGER,
                     scheduled_for TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'planned',
                     operator TEXT NOT NULL DEFAULT '', program_revision_id INTEGER NOT NULL DEFAULT 0,
+                    transition_policy TEXT NOT NULL DEFAULT 'discard_insertions',
+                    fixed_fade_ms INTEGER NOT NULL DEFAULT 1000,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(block_id) REFERENCES program_blocks(id) ON DELETE SET NULL,
                     FOREIGN KEY(timeline_event_id) REFERENCES timeline_events(id) ON DELETE SET NULL
@@ -269,6 +275,12 @@ class Database:
             },
             "program_occurrences": {
                 "program_revision_id": "INTEGER NOT NULL DEFAULT 0",
+                "transition_policy": "TEXT NOT NULL DEFAULT 'discard_insertions'",
+                "fixed_fade_ms": "INTEGER NOT NULL DEFAULT 1000",
+            },
+            "program_blocks": {
+                "transition_policy": "TEXT NOT NULL DEFAULT 'discard_insertions'",
+                "fixed_fade_ms": "INTEGER NOT NULL DEFAULT 1000",
             },
         }
         for table, additions in columns.items():

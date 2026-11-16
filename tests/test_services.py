@@ -112,7 +112,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(len(created), 1)
         old_items = self.db.all("SELECT source_item_id,status,error_message FROM program_occurrence_items WHERE occurrence_id=? ORDER BY position", (old_occurrence,))
         self.assertEqual([row["source_item_id"] for row in old_items], previous_items)
-        self.assertEqual([row["status"] for row in old_items], ["playing", "skipped", "skipped"])
+        self.assertEqual([row["status"] for row in old_items], ["playing", "discarded", "discarded"])
         self.assertTrue(all("excedente" in row["error_message"] for row in old_items[1:]))
         new_item = self.db.one("SELECT status FROM program_occurrence_items WHERE occurrence_id=?", (created[0],))
         self.assertEqual(new_item["status"], "planned")
@@ -120,6 +120,44 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual((history["title"], history["status"]), ("Já foi ao ar", "completed"))
         self.assertEqual(self.programming.due(datetime(2026, 11, 15, 12, 1)), [])
         self.assertEqual(self.db.one("SELECT COUNT(*) AS n FROM program_occurrences WHERE scheduled_for='2026-11-15 12:01'")["n"], 1)
+
+    def test_fixed_commercial_transition_is_snapshotted_and_discards_excess_without_erasing_history(self):
+        music_files = [make_wav(self.root / f"fixed-music-{index}.wav") for index in range(2)]
+        commercial_file = make_wav(self.root / "fixed-commercial.wav")
+        self.library.import_paths(music_files, category="Música")
+        self.library.import_paths([commercial_file], category="Comercial")
+        music_ids = [int(row["id"]) for row in self.db.all("SELECT id FROM media WHERE category='Música' ORDER BY id")]
+        commercial_id = int(self.db.one("SELECT id FROM media WHERE category='Comercial'")["id"])
+
+        music_block = self.programming.add_block("Bloco musical", "Música", "12:00", [6])
+        for media_id in music_ids:
+            self.programming.add_block_item(music_block, media_id)
+        old_occurrence = self.programming.due(datetime(2026, 11, 15, 12, 0))[0]
+        old_items = self.db.all("SELECT id FROM program_occurrence_items WHERE occurrence_id=? ORDER BY position", (old_occurrence,))
+        self.programming.set_occurrence_item_status(int(old_items[0]["id"]), "playing")
+        history_id = self.db.execute(
+            "INSERT INTO playback_history(media_id,title,path,category,status) VALUES(?,?,?,?,?)",
+            (music_ids[0], "Executada antes do fixo", str(music_files[0].resolve()), "Música", "completed"),
+        )
+
+        fixed_block = self.programming.add_block(
+            "Entrada comercial fixa", "Comercial", "12:01", [6],
+            transition_policy="fixed", fixed_fade_ms=250,
+        )
+        self.assertIsNone(self.programming.next_fixed_transition(datetime(2026, 11, 15, 12, 0, 59)))
+        self.programming.add_block_item(fixed_block, commercial_id)
+        next_fixed = self.programming.next_fixed_transition(datetime(2026, 11, 15, 12, 0, 59))
+        self.assertEqual(next_fixed, {"at": datetime(2026, 11, 15, 12, 1), "block_id": fixed_block, "fade_ms": 250})
+
+        created = self.programming.due(datetime(2026, 11, 15, 12, 1))
+        incoming = self.db.one("SELECT transition_policy,fixed_fade_ms FROM program_occurrences WHERE id=?", (created[0],))
+        self.assertEqual((incoming["transition_policy"], incoming["fixed_fade_ms"]), ("fixed", 250))
+        old_statuses = self.db.all("SELECT status,error_message FROM program_occurrence_items WHERE occurrence_id=? ORDER BY position", (old_occurrence,))
+        self.assertEqual([row["status"] for row in old_statuses], ["playing", "discarded"])
+        self.assertIn("Fixo", old_statuses[1]["error_message"])
+        self.assertEqual(self.db.one("SELECT status FROM playback_history WHERE id=?", (history_id,))["status"], "completed")
+        with self.assertRaisesRegex(ValueError, "bloco comercial"):
+            self.programming.add_block("Fixo inválido", "Música", "13:00", [6], transition_policy="fixed")
 
     def test_same_minute_blocks_are_prepared_once_without_skipping_each_other(self):
         files = [make_wav(self.root / f"same-minute-{index}.wav") for index in range(2)]
