@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from hitmo.main_window import MainWindow
 from hitmo.database import Database
+from hitmo.network_diagnostics import run_diagnostics
 from hitmo.operator_dialog import OperatorDialog
 
 
@@ -449,6 +450,48 @@ class MainWindowIntegrationTests(unittest.TestCase):
             os.environ.pop("HITMO_DATA_DIR", None)
         else:
             os.environ["HITMO_DATA_DIR"] = previous_data_dir
+
+    def test_pgm_continues_while_remote_network_diagnostic_is_offline(self):
+        if not QMediaDevices.audioOutputs():
+            self.skipTest("Nenhuma saída de áudio disponível para executar o WAV de teste.")
+
+        class OfflineClient:
+            base_url = "https://radio.example:8765"
+
+            @staticmethod
+            def health():
+                raise ConnectionError("simulated connection loss")
+
+        previous_data_dir = os.environ.get("HITMO_DATA_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                os.environ["HITMO_DATA_DIR"] = temp
+                audio = self._write_test_audio(Path(temp) / "network-loss.wav", 4.0)
+                window = MainWindow()
+                try:
+                    window._timer.stop()
+                    window.library.import_paths([audio], category="Música")
+                    row = window.db.one("SELECT * FROM media WHERE path=?", (str(audio.resolve()),))
+                    self.assertTrue(window._play_media(row, source_type="manual"))
+                    self.assertTrue(self._wait_until(lambda: window.engine.program.playbackState() == QMediaPlayer.PlaybackState.PlayingState, 2500))
+                    start_position = self._wait_for_player_position(window.engine.program, [], timeout_ms=1800)
+                    self.assertGreater(start_position, 0)
+
+                    results, successful = run_diagnostics(OfflineClient())
+                    self.assertFalse(successful)
+                    self.assertEqual(results[0][0], "Conexão/API")
+                    self.assertEqual(window.engine.program.playbackState(), QMediaPlayer.PlaybackState.PlayingState)
+                    self.assertTrue(self._wait_until(lambda: window.engine.program.position() > start_position, 1200))
+                    self.assertEqual(window.engine.program.playbackState(), QMediaPlayer.PlaybackState.PlayingState)
+                finally:
+                    window.close()
+                    window.deleteLater()
+                    self.app.processEvents()
+        finally:
+            if previous_data_dir is None:
+                os.environ.pop("HITMO_DATA_DIR", None)
+            else:
+                os.environ["HITMO_DATA_DIR"] = previous_data_dir
 
     def test_central_service_controls_exist_without_server(self):
         previous_data_dir = os.environ.get("HITMO_DATA_DIR")

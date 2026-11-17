@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import ssl
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -12,13 +13,28 @@ class HitMoAPIClient:
     """Small standard-library client for the separately hosted central API."""
 
     def __init__(self, base_url: str, username: str, password: str, timeout: float = 3.0, ca_file: str | None = None):
+        parsed = urlsplit(str(base_url))
+        if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("Informe a URL do serviço com http:// ou https:// e nome de servidor.")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
+            raise ValueError("A URL do serviço não pode conter credenciais, caminho, consulta ou fragmento.")
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.password = password
         self.timeout = max(0.25, min(float(timeout), 30.0))
-        self.ssl_context = ssl.create_default_context(cafile=ca_file) if self.base_url.lower().startswith("https://") else None
+        self.ssl_context = ssl.create_default_context(cafile=ca_file) if parsed.scheme.casefold() == "https" else None
 
     def _open(self, request):
+        parsed = urlsplit(self.base_url)
+        host = parsed.hostname or ""
+        loopback = host.casefold() == "localhost"
+        if not loopback:
+            try:
+                loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                loopback = False
+        if parsed.scheme.casefold() != "https" and not loopback:
+            raise ConnectionError("A conexão com a rede local exige HTTPS/TLS; credenciais não foram enviadas.")
         if self.ssl_context is not None:
             return urlopen(request, timeout=self.timeout, context=self.ssl_context)
         return urlopen(request, timeout=self.timeout)
@@ -58,6 +74,15 @@ class HitMoAPIClient:
 
     def version(self):
         return self.request("GET", "/api/v1/version")
+
+    def network_diagnostics(self):
+        return self.request("GET", "/api/v1/network-diagnostics")
+
+    def diagnose_media_path(self, media_id: int):
+        return self.request("GET", f"/api/v1/network-diagnostics/media/{int(media_id)}")
+
+    def diagnose_folder_path(self, folder_id: int):
+        return self.request("GET", f"/api/v1/network-diagnostics/folders/{int(folder_id)}")
 
     def categories(self, include_inactive: bool = False):
         flag = "1" if include_inactive else "0"

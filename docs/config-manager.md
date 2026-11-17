@@ -23,6 +23,8 @@ Na primeira tela, informe o host ou IP do computador da rádio, a porta, se a co
 
 No computador da rádio, o serviço deve estar ativo. Para acesso pela LAN, ele precisa ter sido iniciado com certificado TLS e a porta liberada apenas para a rede privada necessária; consulte [service-api.md](service-api.md). Use compartilhamento UNC acessível pelas credenciais do serviço para mídias em rede. Não compartilhe o SQLite.
 
+Para verificar conexão, certificado, identidade, permissões e acesso a caminhos de mídia pela conta do servidor, use a ferramenta [Diagnóstico de rede](network-diagnostics.md). O diagnóstico de caminhos é feito no computador central e não move nem altera arquivos.
+
 ## Catálogo e arquivos
 
 A edição usa os campos existentes do catálogo: `media.id` (somente identidade), título, artista, categoria, caminho, duração, descrição, ícone e `text_content` (campo adicionado por migração). `material_kind` vem de `material_categories`; tipo não é inferido do nome ou extensão. A tabela mostra ID, título, artista, tipo, categoria, caminho físico, disponibilidade no servidor e estado. Pesquisa filtra nome, artista e caminho; filtros permitem categoria, pasta e estado. A Fase 2D permite criar, editar, desativar e restaurar categorias e pastas remotamente. Nomes de categoria são propagados aos cadastros atuais e eventos de timeline; o histórico e itens de ocorrências materializadas preservam seus snapshots. A troca de tipo de uma categoria usada por materiais é recusada. `modified`, `added_at`, `deactivated_at` e revisões permanecem dados do servidor, não são editáveis pelo operador.

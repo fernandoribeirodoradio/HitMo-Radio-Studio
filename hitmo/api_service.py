@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import ssl
+import stat
 import threading
 import time
 from datetime import datetime, timezone
@@ -106,6 +107,63 @@ def _material_json(row) -> dict[str, Any]:
 
 def _is_unc_path(path: str) -> bool:
     return path.replace("/", "\\").startswith("\\\\")
+
+
+def diagnose_media_path(path: str, expected: str = "file") -> dict[str, str]:
+    """Inspect a configured media path from the server that will play it.
+
+    The response deliberately excludes the path itself. UNC checks are explicit
+    diagnostics because some Windows SMB failures can take several seconds.
+    """
+    value = str(path or "")
+    if not value:
+        return {"status": "missing_path", "detail": "Cadastro sem caminho físico."}
+    if value.startswith("hitmo://"):
+        return {"status": "logical_reference", "detail": "Referência lógica, sem arquivo físico executável."}
+    unc = _is_unc_path(value)
+    try:
+        info = os.stat(value)
+    except PermissionError:
+        return {"status": "permission_denied", "detail": "Sem permissão para acessar o caminho no servidor."}
+    except FileNotFoundError as exc:
+        code = getattr(exc, "winerror", None)
+        if unc and code in {53, 64, 67, 1231, 1232}:
+            return {"status": "share_unavailable", "detail": "Compartilhamento de rede indisponível no servidor."}
+        return {"status": "not_found", "detail": "Arquivo ou diretório não encontrado no servidor."}
+    except OSError as exc:
+        code = getattr(exc, "winerror", None)
+        if code in {5, 65}:
+            return {"status": "permission_denied", "detail": "Sem permissão para acessar o caminho no servidor."}
+        if unc and code in {53, 64, 67, 1231, 1232}:
+            return {"status": "share_unavailable", "detail": "Compartilhamento de rede indisponível no servidor."}
+        if code in {1201, 121, 1233, 1234}:
+            return {"status": "temporarily_unavailable", "detail": "Falha temporária ao acessar o caminho no servidor."}
+        return {"status": "inaccessible", "detail": "O servidor não conseguiu acessar o caminho."}
+    if expected == "directory" and not stat.S_ISDIR(info.st_mode):
+        return {"status": "wrong_type", "detail": "O caminho não aponta para um diretório."}
+    if expected == "file" and not stat.S_ISREG(info.st_mode):
+        return {"status": "wrong_type", "detail": "O caminho não aponta para um arquivo regular."}
+    try:
+        if expected == "directory":
+            with os.scandir(value) as entries:
+                next(entries, None)
+        else:
+            with open(value, "rb") as media_file:
+                media_file.read(1)
+    except PermissionError:
+        return {"status": "permission_denied", "detail": "Sem permissão para ler o caminho no servidor."}
+    except FileNotFoundError:
+        return {"status": "not_found", "detail": "Arquivo ou diretório não encontrado no servidor."}
+    except OSError as exc:
+        code = getattr(exc, "winerror", None)
+        if code in {5, 65}:
+            return {"status": "permission_denied", "detail": "Sem permissão para ler o caminho no servidor."}
+        if unc and code in {53, 64, 67, 1231, 1232}:
+            return {"status": "share_unavailable", "detail": "Compartilhamento de rede indisponível no servidor."}
+        if code in {1201, 121, 1233, 1234}:
+            return {"status": "temporarily_unavailable", "detail": "Falha temporária ao acessar o caminho no servidor."}
+        return {"status": "inaccessible", "detail": "O servidor não conseguiu ler o caminho."}
+    return {"status": "accessible", "detail": "Acessível pelo servidor de reprodução."}
 
 
 def _parse_days(value: Any) -> list[int]:
@@ -315,6 +373,41 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
                     "authenticated_as": user["username"],
                     "role": user["role"],
                 })
+                return
+            if path == "/api/v1/network-diagnostics":
+                user = self._authenticate("catalog.read")
+                catalog = self.server.db.one("SELECT revision FROM catalog_state WHERE id=1")
+                program = self.server.db.one("SELECT revision FROM program_state WHERE id=1")
+                self._send(200, {
+                    "authenticated_as": user["username"], "role": user["role"],
+                    "permissions": sorted(ROLE_SCOPES[user["role"]]),
+                    "catalog_revision": int(catalog["revision"]),
+                    "program_revision": int(program["revision"]),
+                    "path_probe_location": "central_playback_server",
+                })
+                return
+            match = re.fullmatch(r"/api/v1/network-diagnostics/(media|folders)/(\d+)", path)
+            if match:
+                self._authenticate("catalog.read")
+                entity, raw_id = match.groups()
+                ident = int(raw_id)
+                if entity == "media":
+                    row = self.server.db.one(
+                        "SELECT m.id,m.title,m.category,m.path,COALESCE(c.material_kind,'audio') AS material_kind "
+                        "FROM media m LEFT JOIN material_categories c ON c.name=m.category WHERE m.id=?",
+                        (ident,),
+                    )
+                    if not row:
+                        raise APIError(404, "Material não encontrado.")
+                    result = diagnose_media_path(str(row["path"] or ""), "file")
+                    result.update({"entity": "media", "id": ident, "title": row["title"], "category": row["category"], "material_kind": row["material_kind"]})
+                else:
+                    row = self.server.db.one("SELECT id,name,path FROM media_folders WHERE id=?", (ident,))
+                    if not row:
+                        raise APIError(404, "Pasta não encontrada.")
+                    result = diagnose_media_path(str(row["path"] or ""), "directory")
+                    result.update({"entity": "folder", "id": ident, "title": row["name"]})
+                self._send(200, result)
                 return
             if path == "/api/v1/categories":
                 self._authenticate("catalog.read")

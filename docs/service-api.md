@@ -44,12 +44,15 @@ As mídias precisam existir no caminho visto pelo computador da rádio. O cadast
 
 ## Rotas
 
-Todas as rotas abaixo, exceto `/healthz`, exigem HTTP Basic Auth sobre loopback ou HTTPS. Escritas de catálogo exigem `If-Match` com a revisão global consultada em `/api/v1/version`. Conflitos retornam HTTP 409. Papéis `reader`, `editor` e `admin` têm permissões distintas.
+Todas as rotas abaixo, exceto `/healthz`, exigem HTTP Basic Auth sobre loopback ou HTTPS. Escritas de catálogo exigem `If-Match` com a revisão global consultada em `/api/v1/version`. Conflitos retornam HTTP 409. Papéis `reader`, `editor` e `admin` têm permissões distintas. O cliente HitMo também bloqueia HTTP para host não loopback antes de enviar credenciais.
 
 | Método e rota | Acesso | Uso |
 | --- | --- | --- |
 | `GET /healthz` | Sem credencial | Disponibilidade e versão |
 | `GET /api/v1/version` | Leitura | Versão, revisão do catálogo e da programação |
+| `GET /api/v1/network-diagnostics` | Leitura de catálogo | Identidade, papel, permissões e revisões, sem segredos |
+| `GET /api/v1/network-diagnostics/media/{id}` | Leitura de catálogo | Testa o arquivo no computador central; não devolve o caminho |
+| `GET /api/v1/network-diagnostics/folders/{id}` | Leitura de catálogo | Testa o diretório no computador central; não devolve o caminho |
 | `GET /api/v1/categories` | Leitura | Categorias; `?include_inactive=1` inclui inativas |
 | `GET /api/v1/folders` | Leitura | Pastas cadastradas |
 | `POST /api/v1/categories`, `PUT /api/v1/categories/{id}` | Edição | Criar/editar categoria; exige revisão do catálogo |
@@ -118,3 +121,5 @@ python -m unittest discover -s tests -v
 ```
 
 Os testes do serviço usam banco temporário e processos locais. Eles validam API entre processos no mesmo computador, mas não comprovam conectividade entre duas máquinas, políticas de firewall, certificado implantado, nem operação de áudio em hardware real. Para o ConfigManager independente, veja [config-manager.md](config-manager.md).
+
+Para rodar o diagnóstico da estação remota e testar caminhos no computador responsável pela reprodução, veja [network-diagnostics.md](network-diagnostics.md). As sondagens de arquivo são explícitas por ID e executadas no servidor central; resultados `accessible` confirmam acesso daquele processo/conta naquele momento, não a disponibilidade futura do compartilhamento.

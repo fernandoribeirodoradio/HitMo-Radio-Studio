@@ -93,6 +93,38 @@ class CentralAPIProcessTests(unittest.TestCase):
         self.assertIn("program_revision", version)
         self.assertEqual(version["authenticated_as"], "test-admin")
 
+    def test_network_diagnostics_reports_role_revisions_and_server_side_file_access(self):
+        audio = self._write_audio("diagnostic.wav")
+        created = self.admin.add_material(
+            {"path": str(audio), "title": "Arquivo de teste", "category": "Música"},
+            self.admin.version()["catalog_revision"],
+        )
+        diagnostics = self.admin.network_diagnostics()
+        self.assertEqual(diagnostics["role"], "admin")
+        self.assertEqual(diagnostics["authenticated_as"], "test-admin")
+        self.assertIn("program.read", diagnostics["permissions"])
+        self.assertEqual(diagnostics["path_probe_location"], "central_playback_server")
+        probe = self.admin.diagnose_media_path(created["id"])
+        self.assertEqual((probe["id"], probe["status"]), (created["id"], "accessible"))
+        self.assertNotIn("path", probe)
+        self.assertEqual(self.reader.network_diagnostics()["role"], "reader")
+        with self.assertRaisesRegex(RuntimeError, "401"):
+            HitMoAPIClient(f"http://127.0.0.1:{self.port}", "bad", "wrong-password").network_diagnostics()
+
+    def test_network_diagnostics_marks_missing_media_and_folder_from_server(self):
+        missing = self.root / "offline" / "missing.wav"
+        created = self.admin.add_material(
+            {"path": str(missing), "title": "Ausente", "category": "Música"},
+            self.admin.version()["catalog_revision"],
+        )
+        folder_id = self.db.execute(
+            "INSERT INTO media_folders(name,path) VALUES(?,?)", ("Pasta ausente", str(self.root / "offline-folder"))
+        )
+        media = self.admin.diagnose_media_path(created["id"])
+        folder = self.admin.diagnose_folder_path(folder_id)
+        self.assertEqual(media["status"], "not_found")
+        self.assertEqual(folder["status"], "not_found")
+
     def test_authentication_and_role_permissions(self):
         bad = HitMoAPIClient(f"http://127.0.0.1:{self.port}", "missing-user", "wrong-password-123")
         with self.assertRaisesRegex(RuntimeError, "401"):
