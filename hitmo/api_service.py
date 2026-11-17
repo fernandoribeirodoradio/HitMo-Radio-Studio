@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
 from .database import Database, default_data_dir
+from .services import PlaybackHistoryService
 
 PASSWORD_ITERATIONS = 310_000
 MAX_BODY_BYTES = 1_048_576
@@ -456,11 +457,19 @@ class HitMoRequestHandler(BaseHTTPRequestHandler):
                     offset = max(0, int(query.get("offset", ["0"])[0]))
                 except ValueError as exc:
                     raise APIError(400, "limit/offset devem ser inteiros.") from exc
-                rows = self.server.db.all(
-                    "SELECT id,media_id,title,artist,path,category,operator,started_at,ended_at,played_seconds,status,planned_for,source_type,error_message "
-                    "FROM playback_history ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset),
-                )
-                self._send(200, {"history": [_jsonable(row) for row in rows], "limit": limit, "offset": offset})
+                try:
+                    result = PlaybackHistoryService(self.server.db).query(
+                        start_date=query.get("from", [""])[0], end_date=query.get("to", [""])[0],
+                        material=query.get("material", [""])[0], category=query.get("category", [""])[0],
+                        status=query.get("status", [""])[0], limit=limit, offset=offset,
+                    )
+                except ValueError as exc:
+                    raise APIError(400, str(exc)) from exc
+                self._send(200, {
+                    "history": [_jsonable(row) for row in result["history"]],
+                    "total": result["total"], "limit": limit, "offset": offset,
+                    "evidence_scope": "software_events_only",
+                })
                 return
             if path == "/api/v1/clients":
                 self._authenticate("clients.read")

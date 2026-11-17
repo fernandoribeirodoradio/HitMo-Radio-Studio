@@ -9,11 +9,11 @@ import sys
 from datetime import datetime, datetime as _SystemDateTime
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, Qt, QTimer, QUrl
+from PySide6.QtCore import QDate, QProcess, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QDockWidget, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog,
+    QDateEdit, QDockWidget, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QMessageBox, QProgressBar, QPushButton, QStyle, QTableWidget, QTableWidgetItem,
     QTimeEdit, QVBoxLayout, QWidget,
@@ -26,7 +26,7 @@ from .database import Database
 from .operator_dialog import OperatorDialog
 from .programming_dialog import ProgramManagerDialog
 from .playlist_compat import PlaylistConfigImporter
-from .services import MediaLibrary, PlaylistService, ProgrammingService, TimelineService
+from .services import MediaLibrary, PlaybackHistoryService, PlaylistService, ProgrammingService, TimelineService
 
 ROLE = Qt.ItemDataRole.UserRole
 
@@ -135,9 +135,11 @@ class MainWindow(QMainWindow):
         self.playlist = PlaylistService(self.db)
         self.timeline = TimelineService(self.db)
         self.programming = ProgrammingService(self.db)
+        self.history = PlaybackHistoryService(self.db)
         self.engine = AudioEngine(self.db.setting("audio_output_id"))
         self._current = None
         self._history_id = None
+        self._history_offset = 0
         self._current_queue_id = None
         self._current_occurrence_item_id = None
         self._current_source_type = "manual"
@@ -388,19 +390,57 @@ class MainWindow(QMainWindow):
         self.program_dock.setWidget(program_panel)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.program_dock)
 
-        self.history_table = QTableWidget(0, 7)
-        self.history_table.setHorizontalHeaderLabels(["Início", "Fim", "Material", "Categoria", "Operador", "Situação", "Programado para"])
+        history_filters = QHBoxLayout()
+        self.history_period_enabled = QCheckBox("Período")
+        self.history_from = QDateEdit(QDate.currentDate().addDays(-7))
+        self.history_from.setCalendarPopup(True)
+        self.history_to = QDateEdit(QDate.currentDate())
+        self.history_to.setCalendarPopup(True)
+        self.history_from.setEnabled(False)
+        self.history_to.setEnabled(False)
+        self.history_material = QLineEdit()
+        self.history_material.setPlaceholderText("Material, artista, caminho ou ID")
+        self.history_category = QComboBox()
+        self.history_category.addItem("Todas as categorias", "")
+        self.history_status = QComboBox()
+        self.history_status.addItem("Todas as situações", "")
+        self.history_apply = QPushButton("Consultar")
+        history_filters.addWidget(self.history_period_enabled)
+        history_filters.addWidget(self.history_from)
+        history_filters.addWidget(QLabel("até"))
+        history_filters.addWidget(self.history_to)
+        history_filters.addWidget(self.history_material, 1)
+        history_filters.addWidget(self.history_category)
+        history_filters.addWidget(self.history_status)
+        history_filters.addWidget(self.history_apply)
+        self.history_count = QLabel()
+        self.history_prev = QPushButton("‹ Anterior")
+        self.history_next = QPushButton("Próxima ›")
+        self.history_prev.clicked.connect(lambda: self._history_page(-1))
+        self.history_next.clicked.connect(lambda: self._history_page(1))
+        self.history_table = QTableWidget(0, 17)
+        self.history_table.setHorizontalHeaderLabels([
+            "Evento no software", "Registro", "Início PGM", "Fim PGM", "Material", "ID material", "Categoria",
+            "Operador", "Situação do item", "Seleção", "Situação da ocorrência", "Programado para", "Selecionado em", "Bloco", "Ocorrência", "Segundos", "Motivo/erro",
+        ])
         self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.history_table.horizontalHeader().setStretchLastSection(True)
         history_panel = QWidget()
         hl = QVBoxLayout(history_panel)
         hl.setContentsMargins(8, 8, 8, 8)
+        hl.addLayout(history_filters)
+        history_paging = QHBoxLayout()
+        history_paging.addWidget(self.history_count, 1)
+        history_paging.addWidget(self.history_prev)
+        history_paging.addWidget(self.history_next)
+        hl.addLayout(history_paging)
+        hl.addWidget(QLabel("Registro de eventos observados pelo HitMo; não comprova o sinal efetivamente transmitido."))
         hl.addWidget(self.history_table)
         export = QPushButton("Exportar CSV…")
         export.clicked.connect(self._export_history)
         hl.addWidget(export)
-        self.history_dock = QDockWidget("Histórico de execução", self)
+        self.history_dock = QDockWidget("Eventos de reprodução · histórico", self)
         self.history_dock.setObjectName("historyDock")
         self.history_dock.setWidget(history_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.history_dock)
@@ -409,6 +449,10 @@ class MainWindow(QMainWindow):
         self.program_dock.raise_()
 
         self._build_menus()
+        self.history_period_enabled.toggled.connect(self._toggle_history_period)
+        self.history_apply.clicked.connect(self._apply_history_filters)
+        self.history_material.returnPressed.connect(self._apply_history_filters)
+        self._refresh_history_filter_options()
 
         self.statusBar().showMessage("Automação pronta · programação persistente")
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self._start_or_resume)
@@ -891,6 +935,30 @@ class MainWindow(QMainWindow):
         if self.engine.program.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.engine.pause_program()
 
+    def _insert_playback_history(
+        self, row: dict, *, status: str, source_type: str, source_ref: int | None,
+        scheduled_for: str, occurrence_item_id: int | None = None, error_message: str = "",
+    ) -> int:
+        material_id = row.get("id", row.get("media_id"))
+        context = self.db.one(
+            "SELECT o.id AS occurrence_id,o.block_id,o.block_name_snapshot "
+            "FROM program_occurrence_items i JOIN program_occurrences o ON o.id=i.occurrence_id WHERE i.id=?",
+            (occurrence_item_id,),
+        ) if occurrence_item_id else None
+        return self.db.execute(
+            "INSERT INTO playback_history(media_id,title,artist,path,category,operator,started_at,ended_at,status,planned_for,"
+            "source_type,source_ref,material_id_snapshot,occurrence_id,block_id,block_name_snapshot,error_message) "
+            "VALUES(?,?,?,?,?,?, '',CASE WHEN ?='failed' THEN CURRENT_TIMESTAMP ELSE '' END,?,?,?,?,?,?,?,?,?)",
+            (
+                material_id, row.get("title", ""), row.get("artist", ""), row.get("path", ""),
+                row.get("category", "Música"), self.operator_combo.currentText(), status, status,
+                scheduled_for, source_type, source_ref, material_id,
+                int(context["occurrence_id"]) if context else None,
+                int(context["block_id"]) if context and context["block_id"] is not None else None,
+                str(context["block_name_snapshot"] or "") if context else "", error_message,
+            ),
+        )
+
     def _play_media(self, row, *, source_type="operator_override", source_ref=None, queue_id=None, occurrence_item_id=None, scheduled_for=""):
         # Database queries return sqlite3.Row, which is indexable but does not
         # implement dict.get(); normalize once for all playback sources.
@@ -902,17 +970,18 @@ class MainWindow(QMainWindow):
                 self.playlist.set_status(queue_id, "failed")
             if occurrence_item_id:
                 self.programming.set_occurrence_item_status(occurrence_item_id, "failed", message)
-            self.db.execute(
-                "INSERT INTO playback_history(media_id,title,artist,path,category,operator,started_at,ended_at,status,planned_for,source_type,source_ref,error_message) VALUES(?,?,?,?,?,?, '',CURRENT_TIMESTAMP,'failed',?,?,?,?)",
-                (row.get("id", row.get("media_id")), row.get("title", ""), row.get("artist", ""), row.get("path", ""), row.get("category", ""), self.operator_combo.currentText(), scheduled_for, source_type, source_ref, message),
+            self._insert_playback_history(
+                row, status="failed", source_type=source_type, source_ref=source_ref,
+                scheduled_for=scheduled_for, occurrence_item_id=occurrence_item_id, error_message=message,
             )
             self._refresh_history()
             return False
         if not Path(row["path"]).is_file():
             operator = self.operator_combo.currentText()
-            self.db.execute(
-                "INSERT INTO playback_history(media_id,title,artist,path,category,operator,started_at,ended_at,status,planned_for,source_type,source_ref,error_message) VALUES(?,?,?,?,?,?, '',CURRENT_TIMESTAMP,'failed',?,?,?,?)",
-                (row.get("id", row.get("media_id")), row.get("title", "Material ausente"), row.get("artist", ""), row.get("path", ""), row.get("category", ""), operator, scheduled_for, source_type, source_ref, "Arquivo não encontrado"),
+            self._insert_playback_history(
+                row, status="failed", source_type=source_type, source_ref=source_ref,
+                scheduled_for=scheduled_for, occurrence_item_id=occurrence_item_id,
+                error_message="Arquivo não encontrado",
             )
             if queue_id:
                 self.playlist.set_status(queue_id, "failed")
@@ -938,9 +1007,9 @@ class MainWindow(QMainWindow):
         self.now_title.setText(row["title"])
         self.now_artist.setText(f"{row['artist']}   ·   {row['category']}" if row["artist"] else str(row["category"]))
         self.position_label.setText(f"00:00 / {self._duration(row['duration'])}")
-        self._history_id = self.db.execute(
-            "INSERT INTO playback_history(media_id,title,artist,path,category,operator,started_at,status,planned_for,source_type,source_ref) VALUES(?,?,?,?,?,?, '', 'loading',?,?,?)",
-            (row.get("id", row.get("media_id")), row.get("title", ""), row.get("artist", ""), row.get("path", ""), row.get("category", "Música"), self.operator_combo.currentText(), scheduled_for, source_type, source_ref),
+        self._history_id = self._insert_playback_history(
+            row, status="loading", source_type=source_type, source_ref=source_ref,
+            scheduled_for=scheduled_for, occurrence_item_id=occurrence_item_id,
         )
         if queue_id:
             self.playlist.set_status(queue_id, "loading")
@@ -1053,9 +1122,10 @@ class MainWindow(QMainWindow):
         if self._history_id:
             self.db.execute("UPDATE playback_history SET started_at=CASE WHEN started_at='' THEN CURRENT_TIMESTAMP ELSE started_at END,status='playing' WHERE id=?", (self._history_id,))
         else:
-            self._history_id = self.db.execute(
-                "INSERT INTO playback_history(media_id,title,artist,path,category,operator,status,planned_for,source_type,source_ref) VALUES(?,?,?,?,?,?,'playing',?,?,?)",
-                (self._current.get("id", self._current.get("media_id")), self._current.get("title", ""), self._current.get("artist", ""), self._current.get("path", ""), self._current.get("category", "Música"), self.operator_combo.currentText(), self._current_planned_for, self._current_source_type, self._current_source_ref),
+            self._history_id = self._insert_playback_history(
+                self._current, status="playing", source_type=self._current_source_type,
+                source_ref=self._current_source_ref, scheduled_for=self._current_planned_for,
+                occurrence_item_id=self._current_occurrence_item_id,
             )
         self._refresh_history()
 
@@ -1296,6 +1366,7 @@ class MainWindow(QMainWindow):
             now,
             preserve_item_id=self._current_occurrence_item_id,
             force_recovery=self._scheduler_first_tick,
+            operator=self.operator_combo.currentText(),
         )
         self._scheduler_first_tick = False
         due = dispatch["dispatch_ids"]
@@ -1353,26 +1424,108 @@ class MainWindow(QMainWindow):
     def _refresh_history(self):
         if not hasattr(self, "history_table"):
             return
+        filters = self._history_filter_values()
+        result = self.history.query(**filters, limit=250, offset=self._history_offset)
         self.history_table.setRowCount(0)
-        rows = self.db.all("SELECT started_at,ended_at,title,artist,path,category,operator,status,planned_for FROM playback_history ORDER BY id DESC LIMIT 250")
-        for row in rows:
+        for row in result["history"]:
             index = self.history_table.rowCount()
             self.history_table.insertRow(index)
             title = f"{row['title']} · {row['artist']}" if row["artist"] else row["title"]
             if row["path"]:
                 title = f"{title} · {Path(row['path']).name}"
-            for col, value in enumerate((row["started_at"], row["ended_at"], title, row["category"], row["operator"], row["status"], row["planned_for"])):
+            values = (
+                row["event_time"], "Execução do player" if row["record_type"] == "player_event" else "Item de ocorrência",
+                row["started_at"], row["ended_at"], title, row["material_id"], row["category"], row["operator"],
+                row["status"], row["selection_state"], row["occurrence_status"], row["planned_for"], row["selected_at"], row["block_name_snapshot"], row["occurrence_id"],
+                f"{float(row['played_seconds'] or 0):.3f}", row["error_message"],
+            )
+            for col, value in enumerate(values):
                 self.history_table.setItem(index, col, QTableWidgetItem(str(value)))
+        self.history_count.setText(
+            f"Exibindo {self._history_offset + 1 if result['history'] else 0}–"
+            f"{self._history_offset + len(result['history'])} de {result['total']} evento(s)."
+        )
+        self.history_prev.setEnabled(self._history_offset > 0)
+        self.history_next.setEnabled(self._history_offset + len(result["history"]) < result["total"])
+
+    def _history_filter_values(self) -> dict[str, str]:
+        return {
+            "start_date": self.history_from.date().toString("yyyy-MM-dd") if self.history_period_enabled.isChecked() else "",
+            "end_date": self.history_to.date().toString("yyyy-MM-dd") if self.history_period_enabled.isChecked() else "",
+            "material": self.history_material.text().strip(),
+            "category": str(self.history_category.currentData() or ""),
+            "status": str(self.history_status.currentData() or ""),
+        }
+
+    def _toggle_history_period(self, enabled: bool):
+        self.history_from.setEnabled(enabled)
+        self.history_to.setEnabled(enabled)
+        if hasattr(self, "history_table"):
+            self._history_offset = 0
+            self._refresh_history()
+
+    def _apply_history_filters(self):
+        self._history_offset = 0
+        self._refresh_history()
+
+    def _history_page(self, direction: int):
+        self._history_offset = max(0, self._history_offset + direction * 250)
+        self._refresh_history()
+
+    def _refresh_history_filter_options(self):
+        if not hasattr(self, "history_category"):
+            return
+        options = self.history.filter_options()
+        current_category = self.history_category.currentData()
+        current_status = self.history_status.currentData()
+        self.history_category.clear()
+        self.history_category.addItem("Todas as categorias", "")
+        for category in options["categories"]:
+            self.history_category.addItem(category, category)
+        self.history_status.clear()
+        self.history_status.addItem("Todas as situações", "")
+        status_values = sorted(
+            set(options["statuses"]) |
+            {"planned", "selected", "loading", "playing", "paused", "completed", "interrupted", "discarded", "ignored", "failed", "ejected", "stopped", "skipped", "missed", "delayed", "running"},
+            key=str.casefold,
+        )
+        for status in status_values:
+            self.history_status.addItem(status, status)
+        if current_category:
+            index = self.history_category.findData(current_category)
+            if index >= 0:
+                self.history_category.setCurrentIndex(index)
+        if current_status:
+            index = self.history_status.findData(current_status)
+            if index >= 0:
+                self.history_status.setCurrentIndex(index)
 
     def _export_history(self):
         path, _ = QFileDialog.getSaveFileName(self, "Exportar histórico", "hitmo-historico.csv", "CSV (*.csv)")
         if not path:
             return
-        rows = self.db.all("SELECT started_at,ended_at,title,artist,path,category,operator,played_seconds,status,planned_for,source_type,source_ref,error_message FROM playback_history ORDER BY id")
+        filters = self._history_filter_values()
+        rows = []
+        offset = 0
+        while True:
+            page = self.history.query(**filters, limit=1000, offset=offset)["history"]
+            rows.extend(page)
+            if len(page) < 1000:
+                break
+            offset += len(page)
         with open(path, "w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.writer(handle, delimiter=";")
-            writer.writerow(["Início", "Fim", "Título", "Artista", "Arquivo", "Categoria", "Operador", "Segundos executados", "Situação", "Programado para", "Origem", "Referência da origem", "Erro"])
-            writer.writerows([tuple(row) for row in rows])
+            writer.writerow([
+                "Evento no software", "Tipo de registro", "Início PGM", "Fim PGM", "Título", "Artista", "ID do material", "Arquivo", "Categoria",
+                "Operador", "Segundos do player", "Situação do item", "Seleção", "Situação da ocorrência", "Programado para", "Selecionado em", "Origem", "Referência da origem",
+                "ID da ocorrência", "ID do bloco", "Snapshot do bloco", "Erro/motivo",
+            ])
+            writer.writerows([(
+                row["event_time"], row["record_type"], row["started_at"], row["ended_at"], row["title"], row["artist"], row["material_id"], row["path"],
+                row["category"], row["operator"], row["played_seconds"], row["status"], row["selection_state"], row["occurrence_status"], row["planned_for"], row["selected_at"],
+                row["source_type"], row["source_ref"], row["occurrence_id"], row["block_id"],
+                row["block_name_snapshot"], row["error_message"],
+            ) for row in rows])
         self.statusBar().showMessage(f"Histórico exportado: {path}", 7000)
 
     def closeEvent(self, event):

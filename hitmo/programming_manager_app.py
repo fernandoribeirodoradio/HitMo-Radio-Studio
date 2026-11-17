@@ -124,6 +124,7 @@ class ProgrammingManagerWindow(QMainWindow):
         self.draft_status = "local"
         self.draft_name = ""
         self.dirty = False
+        self._history_offset = 0
         self.setWindowTitle("HitMo Programação Remota")
         self.resize(1340, 820)
         self._build_ui()
@@ -236,14 +237,56 @@ class ProgrammingManagerWindow(QMainWindow):
         occurrence_layout.addWidget(self.occurrence_table, 1)
         self.tabs.addTab(occurrence_panel, "Ocorrências programadas")
 
-        self.history_table = self._table(["Início real", "Fim real", "Material", "Artista", "Categoria", "Operador", "Situação", "Programado para", "Erro"])
+        self.history_period_enabled = QCheckBox("Filtrar período")
+        self.history_start = QDateEdit()
+        self.history_start.setCalendarPopup(True)
+        self.history_start.setDate(date.today())
+        self.history_start.setEnabled(False)
+        self.history_end = QDateEdit()
+        self.history_end.setCalendarPopup(True)
+        self.history_end.setDate(date.today())
+        self.history_end.setEnabled(False)
+        self.history_material = QLineEdit()
+        self.history_material.setPlaceholderText("Material, artista, caminho ou ID")
+        self.history_category = QLineEdit()
+        self.history_category.setPlaceholderText("Categoria exata (opcional)")
+        self.history_status = QComboBox()
+        self.history_status.addItem("Todas as situações", "")
+        for value in ("planned", "selected", "loading", "playing", "paused", "completed", "interrupted", "discarded", "ignored", "failed", "ejected", "stopped", "skipped", "missed", "delayed", "running"):
+            self.history_status.addItem(value, value)
+        self.history_table = self._table([
+            "Evento no software", "Registro", "Início PGM", "Fim PGM", "Material", "ID material", "Categoria",
+            "Operador", "Situação do item", "Seleção", "Situação da ocorrência", "Programado para", "Selecionado em", "Bloco", "Ocorrência", "Segundos", "Motivo/erro",
+        ])
         history_panel = QWidget()
         history_layout = QVBoxLayout(history_panel)
+        history_filters = QHBoxLayout()
+        history_filters.addWidget(self.history_period_enabled)
+        history_filters.addWidget(self.history_start)
+        history_filters.addWidget(QLabel("até"))
+        history_filters.addWidget(self.history_end)
+        history_filters.addWidget(self.history_material, 1)
+        history_filters.addWidget(self.history_category)
+        history_filters.addWidget(self.history_status)
         self.refresh_history_button = QPushButton("Consultar histórico de execução")
-        self.refresh_history_button.clicked.connect(self.refresh_history)
-        history_layout.addWidget(self.refresh_history_button)
+        self.refresh_history_button.clicked.connect(self._apply_history_filters)
+        self.history_material.returnPressed.connect(self._apply_history_filters)
+        self.history_period_enabled.toggled.connect(self._toggle_history_period)
+        history_filters.addWidget(self.refresh_history_button)
+        self.history_count = QLabel()
+        history_layout.addLayout(history_filters)
+        history_paging = QHBoxLayout()
+        history_paging.addWidget(self.history_count, 1)
+        self.history_prev = QPushButton("‹ Anterior")
+        self.history_next = QPushButton("Próxima ›")
+        self.history_prev.clicked.connect(lambda: self._history_page(-1))
+        self.history_next.clicked.connect(lambda: self._history_page(1))
+        history_paging.addWidget(self.history_prev)
+        history_paging.addWidget(self.history_next)
+        history_layout.addLayout(history_paging)
+        history_layout.addWidget(QLabel("Eventos observados pelo HitMo; não constituem comprovação do sinal transmitido."))
         history_layout.addWidget(self.history_table, 1)
-        self.tabs.addTab(history_panel, "Histórico executado")
+        self.tabs.addTab(history_panel, "Histórico operacional")
         layout.addWidget(self.tabs, 1)
         self.status = QLabel("Pronto")
         layout.addWidget(self.status)
@@ -735,17 +778,50 @@ class ProgrammingManagerWindow(QMainWindow):
 
     def refresh_history(self):
         try:
-            history = self.api.history(limit=500)["history"]
+            history_page = self.api.history(
+                limit=250, offset=self._history_offset,
+                start_date=self.history_start.date().toString("yyyy-MM-dd") if self.history_period_enabled.isChecked() else "",
+                end_date=self.history_end.date().toString("yyyy-MM-dd") if self.history_period_enabled.isChecked() else "",
+                material=self.history_material.text().strip(), category=self.history_category.text().strip(),
+                status=str(self.history_status.currentData() or ""),
+            )
+            history = history_page["history"]
             self.history_table.setRowCount(0)
             for entry in history:
                 row = self.history_table.rowCount()
                 self.history_table.insertRow(row)
-                values = (entry.get("started_at"), entry.get("ended_at"), entry.get("title"), entry.get("artist"), entry.get("category"), entry.get("operator"), entry.get("status"), entry.get("planned_for"), entry.get("error_message"))
+                title = entry.get("title", "") + (f" · {entry['artist']}" if entry.get("artist") else "")
+                values = (
+                    entry.get("event_time"), "Execução do player" if entry.get("record_type") == "player_event" else "Item de ocorrência",
+                    entry.get("started_at"), entry.get("ended_at"), title, entry.get("material_id"),
+                    entry.get("category"), entry.get("operator"), entry.get("status"), entry.get("selection_state"), entry.get("occurrence_status"), entry.get("planned_for"), entry.get("selected_at"),
+                    entry.get("block_name_snapshot"), entry.get("occurrence_id"), entry.get("played_seconds"),
+                    entry.get("error_message"),
+                )
                 for column, value in enumerate(values):
                     self.history_table.setItem(row, column, QTableWidgetItem(str(value or "")))
             self.history_table.resizeColumnsToContents()
+            self.history_count.setText(
+                f"Exibindo {self._history_offset + 1 if history else 0}–"
+                f"{self._history_offset + len(history)} de {history_page.get('total', len(history))} evento(s)."
+            )
+            self.history_prev.setEnabled(self._history_offset > 0)
+            self.history_next.setEnabled(self._history_offset + len(history) < history_page.get("total", len(history)))
         except (ConnectionError, RuntimeError, OSError, ValueError) as exc:
             self.status.setText(f"Falha ao consultar histórico: {exc}")
+
+    def _toggle_history_period(self, enabled: bool):
+        self.history_start.setEnabled(enabled)
+        self.history_end.setEnabled(enabled)
+        self._apply_history_filters()
+
+    def _apply_history_filters(self):
+        self._history_offset = 0
+        self.refresh_history()
+
+    def _history_page(self, direction: int):
+        self._history_offset = max(0, self._history_offset + direction * 250)
+        self.refresh_history()
 
 
 def main() -> int:

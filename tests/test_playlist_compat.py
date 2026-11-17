@@ -136,11 +136,18 @@ class PlaylistCompatibilityTests(unittest.TestCase):
         self.assertIn("text_content", {row["name"] for row in migrated.all("PRAGMA table_info(media)")})
         self.assertIn("status", {row["name"] for row in migrated.all("PRAGMA table_info(playlist_items)")})
         self.assertIn("duration", {row["name"] for row in migrated.all("PRAGMA table_info(program_occurrence_items)")})
+        self.assertIn("media_id_snapshot", {row["name"] for row in migrated.all("PRAGMA table_info(program_occurrence_items)")})
         self.assertIn("transition_policy", {row["name"] for row in migrated.all("PRAGMA table_info(program_blocks)")})
         self.assertIn("fixed_fade_ms", {row["name"] for row in migrated.all("PRAGMA table_info(program_blocks)")})
         occurrence_columns = {row["name"] for row in migrated.all("PRAGMA table_info(program_occurrences)")}
         self.assertIn("transition_policy", occurrence_columns)
         self.assertIn("fixed_fade_ms", occurrence_columns)
+        self.assertIn("block_name_snapshot", occurrence_columns)
+        history_columns = {row["name"] for row in migrated.all("PRAGMA table_info(playback_history)")}
+        self.assertTrue({"material_id_snapshot", "occurrence_id", "block_id", "block_name_snapshot"}.issubset(history_columns))
+        preserved_history = migrated.one("SELECT title,operator FROM playback_history WHERE id=1")
+        self.assertEqual((preserved_history["title"], preserved_history["operator"]), ("Canção antiga", "Operador antigo"))
+        self.assertEqual(migrated.one("SELECT material_id_snapshot FROM playback_history WHERE id=1")["material_id_snapshot"], 1)
         self.assertIn("dispatch_delay_ms", occurrence_columns)
         self.assertIn("dispatch_reason", occurrence_columns)
         self.assertTrue(migrated.one("SELECT name FROM sqlite_master WHERE type='table' AND name='scheduler_decisions'"))

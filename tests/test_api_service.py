@@ -358,7 +358,11 @@ class CentralAPIProcessTests(unittest.TestCase):
             "INSERT INTO program_occurrence_items(occurrence_id,source_item_id,media_id,position,title,path,category,status) VALUES(?,?,?,?,?,?,?,'playing')",
             (occurrence_id, item_id, media_id, 0, "Frozen title", str(audio), "Música"),
         )
-        self.db.execute("INSERT INTO playback_history(media_id,title,path,status) VALUES(?,?,?,'playing')", (media_id, "Frozen title", str(audio)))
+        self.db.execute(
+            "INSERT INTO playback_history(media_id,material_id_snapshot,title,path,status,source_type,source_ref,occurrence_id,block_id,block_name_snapshot) "
+            "VALUES(?,?,?,?,'playing','scheduled_block',?,?,?,'Manhã')",
+            (media_id, media_id, "Frozen title", str(audio), item_id, occurrence_id, block_id),
+        )
 
         state = self.admin.programs()
         block = state["blocks"][0]
@@ -444,6 +448,47 @@ class CentralAPIProcessTests(unittest.TestCase):
         self.admin = HitMoAPIClient(f"http://127.0.0.1:{self.port}", "test-admin", self.password)
         self.assertEqual(self.admin.materials()["materials"][0]["title"], "Persistent")
         self.assertEqual(len(self.admin.history()["history"]), 1)
+
+    def test_remote_history_filters_and_declares_software_event_scope(self):
+        for title, started_at, status, category in (
+            ("Oferta", "2026-11-14 23:55:00", "completed", "Comercial"),
+            ("Oferta reprise", "2026-11-15 00:10:00", "interrupted", "Comercial"),
+            ("Vinheta", "2026-11-15 08:00:00", "completed", "Vinheta"),
+        ):
+            self.db.execute(
+                "INSERT INTO playback_history(media_id,material_id_snapshot,title,path,category,operator,started_at,ended_at,status,block_name_snapshot) "
+                "VALUES(NULL,?,?,?,?,?,?,?,?,?)",
+                (77, title, f"C:/Audio/{title}.wav", category, "Locutor", started_at, started_at, status, "Bloco snapshot"),
+            )
+
+        result = self.admin.history(
+            start_date="2026-11-15", end_date="2026-11-15", material="Oferta",
+            category="Comercial", status="interrupted", limit=1,
+        )
+        self.assertEqual((result["total"], len(result["history"])), (1, 1))
+        entry = result["history"][0]
+        self.assertEqual((entry["title"], entry["material_id"], entry["block_name_snapshot"]),
+                         ("Oferta reprise", 77, "Bloco snapshot"))
+        self.assertEqual(result["evidence_scope"], "software_events_only")
+        block_id = self.db.execute(
+            "INSERT INTO program_blocks(name,block_type,time_of_day) VALUES('Bloco perdido','Comercial','09:00')"
+        )
+        occurrence_id = self.db.execute(
+            "INSERT INTO program_occurrences(origin_type,block_id,scheduled_for,status,operator,block_name_snapshot) "
+            "VALUES('block',?,'2026-11-15 09:00','missed','Operador da manhã','Bloco perdido')",
+            (block_id,),
+        )
+        self.db.execute(
+            "INSERT INTO program_occurrence_items(occurrence_id,media_id_snapshot,position,title,path,category,status,ended_at,error_message) "
+            "VALUES(?,?,0,'Oferta ignorada','C:/Audio/ignorada.wav','Comercial','ignored','2026-11-15 09:00:30','Atraso')",
+            (occurrence_id, 77),
+        )
+        ignored = self.admin.history(material="77", status="ignored")["history"]
+        self.assertEqual(len(ignored), 1)
+        self.assertEqual((ignored[0]["record_type"], ignored[0]["occurrence_status"], ignored[0]["operator"]),
+                         ("occurrence_item", "missed", "Operador da manhã"))
+        with self.assertRaisesRegex(RuntimeError, "400"):
+            self.admin.history(start_date="15/11/2026")
 
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@ python -m hitmo.app
 
 Ou, depois de instalar as dependências, execute `run_hitmo.bat`. O banco SQLite e as preferências ficam em `%APPDATA%\HitMo Radio Studio`. Para usar outro diretório de dados, defina `HITMO_DATA_DIR` antes de iniciar.
 
-A arquitetura modular inclui biblioteca de mídia, playlist persistente com arrastar e soltar, player principal, pré-escuta, trilhas em loop, avanço automático, timeline musical e comercial, operadores e histórico com exportação CSV. Para iniciar, importe uma pasta de áudio na Biblioteca, adicione mídias à playlist ou cadastre eventos na Timeline.
+A arquitetura modular inclui biblioteca de mídia, playlist persistente com arrastar e soltar, player principal, pré-escuta, trilhas em loop, avanço automático, timeline musical e comercial, operadores e histórico com exportação CSV. O histórico separa eventos observados pelo player de itens e estados das ocorrências, com filtros por período, material, categoria e situação. É um registro do software, não comprovação do sinal transmitido. Para iniciar, importe uma pasta de áudio na Biblioteca, adicione mídias à playlist ou cadastre eventos na Timeline. Detalhes em [docs/historico-operacional.md](docs/historico-operacional.md).
 
 Para consultar sem alterar o Playlist Digital, use **Cadastro > Ler catálogo do Playlist (Folders.xml)…** e selecione o arquivo de configuração. O HitMo salva um snapshot dos campos e caminhos no SQLite e informa quais diretórios existem neste computador. Esta operação não varre mídias, não segue atalhos e não escreve no diretório do Playlist. Detalhes e limitações estão em `docs/playlist-compatibility.md`.
 
@@ -60,7 +60,7 @@ Para montar, revisar e publicar grades remotamente, execute também:
 python -m hitmo.programming_manager_app
 ```
 
-Ou abra `run_programming_manager.bat`. O módulo cria rascunhos revisionados, organiza blocos musicais/comerciais e sequências, publica quando a revisão-base ainda é atual e consulta ocorrências materializadas e histórico real. O serviço central não oferece comandos remotos de reprodução. Detalhes e limites em [docs/programacao-remota.md](docs/programacao-remota.md).
+Ou abra `run_programming_manager.bat`. O módulo cria rascunhos revisionados, organiza blocos musicais/comerciais e sequências, publica quando a revisão-base ainda é atual e consulta ocorrências materializadas e histórico filtrável. O serviço central não oferece comandos remotos de reprodução. Detalhes e limites em [docs/programacao-remota.md](docs/programacao-remota.md) e [docs/service-api.md](docs/service-api.md).
 
 ## Executar o protótipo original
 

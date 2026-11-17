@@ -67,10 +67,14 @@ Todas as rotas abaixo, exceto `/healthz`, exigem HTTP Basic Auth sobre loopback 
 | `GET, POST /api/v1/program-drafts` | Leitura ou edição | Listar e criar rascunhos baseados em revisão |
 | `GET, PUT /api/v1/program-drafts/{id}` | Leitura ou edição | Consultar e alterar rascunho próprio |
 | `POST /api/v1/program-drafts/{id}/publish` | Edição | Publicar se a revisão-base ainda for atual |
-| `GET /api/v1/history` | Leitura | Histórico efetivamente registrado; aceita `limit` e `offset` |
+| `GET /api/v1/history` | Leitura | Consulta operacional com eventos do player e itens de ocorrência; filtros `from`, `to`, `material`, `category`, `status`, `limit`, `offset` |
 | `GET /api/v1/clients` | Admin | Clientes autenticados recentemente ativos |
 
 Publicar uma programação altera os blocos salvos para execuções futuras. Ocorrências já geradas, seus itens congelados e o histórico não são removidos ou reescritos. Materiais são desativados logicamente, nunca apagados da unidade de armazenamento. A revisão de catálogo e a revisão de programação são separadas.
+
+`GET /api/v1/history` retorna `total`, `limit`, `offset` e `evidence_scope=software_events_only`. Cada linha tem `record_type` para separar uma tentativa observada pelo player (`player_event`) de um item registrado somente na ocorrência (`occurrence_item`). `status` descreve a situação do item/evento; `occurrence_status` mantém o estado da ocorrência à parte. Os filtros de período usam `event_time`, o horário de início do player ou, para itens sem tentativa, o horário de seleção/registro. Data deve estar em `AAAA-MM-DD`; a data final é inclusiva. A consulta não confirma transmissão no sinal de saída.
+
+Os detalhes do ciclo e a semântica dos snapshots estão em [historico-operacional.md](historico-operacional.md).
 
 Categorias e pastas também têm identidade estável e operações lógicas, sem exclusão física. Renomear categoria atualiza os rótulos atuais de materiais e eventos futuros da timeline, preservando histórico e snapshots de ocorrências. A troca do tipo (`audio`, `text`, `file`) é recusada enquanto existirem materiais ligados. Pastas aceitam caminho local do servidor ou UNC; a disponibilidade é verificada no computador do serviço. Editar o caminho da pasta não move arquivos e não reescreve os caminhos individuais dos materiais.
 

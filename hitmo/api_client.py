@@ -4,6 +4,7 @@ import base64
 import json
 import ssl
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
@@ -128,8 +129,18 @@ class HitMoAPIClient:
     def publish_draft(self, draft_id: int, draft_revision: int):
         return self.request("POST", f"/api/v1/program-drafts/{int(draft_id)}/publish", body={}, revision=draft_revision)
 
-    def history(self, limit: int = 100, offset: int = 0):
-        return self.request("GET", f"/api/v1/history?limit={int(limit)}&offset={int(offset)}")
+    def history(
+        self, limit: int = 100, offset: int = 0, *, start_date: str = "", end_date: str = "",
+        material: str = "", category: str = "", status: str = "",
+    ):
+        params = {"limit": int(limit), "offset": int(offset)}
+        params.update({
+            key: value for key, value in (
+                ("from", start_date), ("to", end_date), ("material", material),
+                ("category", category), ("status", status),
+            ) if value
+        })
+        return self.request("GET", f"/api/v1/history?{urlencode(params)}")
 
     def clients(self):
         return self.request("GET", "/api/v1/clients")

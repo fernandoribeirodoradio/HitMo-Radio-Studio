@@ -507,7 +507,7 @@ class ProgrammingService:
 
     def due(
         self, now: datetime, block_ids: set[int] | None = None,
-        timeline_event_ids: set[int] | None = None,
+        timeline_event_ids: set[int] | None = None, operator: str = "",
     ):
         scheduled_for = now.strftime("%Y-%m-%d %H:%M")
         weekday = now.weekday()
@@ -534,9 +534,9 @@ class ProgrammingService:
                 if not items:
                     continue
                 cursor = con.execute(
-                    "INSERT OR IGNORE INTO program_occurrences(origin_type,block_id,scheduled_for,status,program_revision_id,transition_policy,fixed_fade_ms) "
-                    "VALUES('block',?,?,'planned',?,?,?)",
-                    (int(block["id"]), scheduled_for, program_revision, block["transition_policy"], block["fixed_fade_ms"]),
+                    "INSERT OR IGNORE INTO program_occurrences(origin_type,block_id,scheduled_for,status,operator,program_revision_id,transition_policy,fixed_fade_ms,block_name_snapshot) "
+                    "VALUES('block',?,?,'planned',?,?,?,?,?)",
+                    (int(block["id"]), scheduled_for, operator, program_revision, block["transition_policy"], block["fixed_fade_ms"], block["name"]),
                 )
                 if cursor.rowcount:
                     occurrence_id = int(cursor.lastrowid)
@@ -578,16 +578,16 @@ class ProgrammingService:
                                 else:
                                     selection_error = "Pasta sem material de áudio ativo e compatível no momento da seleção."
                             con.execute(
-                                "INSERT INTO program_occurrence_items(occurrence_id,source_item_id,media_id,position,item_kind,title,category,selection_folder_id,selection_mode,selected_at,status,ended_at,error_message) "
-                                "VALUES(?,?,NULL,?,'media',?,'',?,?,?,'failed',?,?)",
+                                "INSERT INTO program_occurrence_items(occurrence_id,source_item_id,media_id,media_id_snapshot,position,item_kind,title,category,selection_folder_id,selection_mode,selected_at,status,ended_at,error_message) "
+                                "VALUES(?,?,NULL,NULL,?,'media',?,'',?,?,?,'failed',?,?)",
                                 (occurrence_id, int(item["id"]), int(item["position"]), f"Pasta indisponível: {folder_title}", folder_id, selection_mode, selected_at, selected_at, selection_error),
                             )
                             continue
                         selected_ids.add(int(selected["id"] if "id" in selected.keys() else selected["media_id"]))
                         con.execute(
-                            "INSERT INTO program_occurrence_items(occurrence_id,source_item_id,media_id,position,item_kind,title,artist,path,category,duration,selection_folder_id,selection_mode,selected_at) "
-                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (occurrence_id, int(item["id"]), int(selected["id"] if "id" in selected.keys() else selected["media_id"]), int(item["position"]), "media", selected["title"], selected["artist"], selected["path"], selected["category"], selected["duration"], folder_id, selection_mode, selected_at),
+                            "INSERT INTO program_occurrence_items(occurrence_id,source_item_id,media_id,media_id_snapshot,position,item_kind,title,artist,path,category,duration,selection_folder_id,selection_mode,selected_at) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (occurrence_id, int(item["id"]), int(selected["id"] if "id" in selected.keys() else selected["media_id"]), int(selected["id"] if "id" in selected.keys() else selected["media_id"]), int(item["position"]), "media", selected["title"], selected["artist"], selected["path"], selected["category"], selected["duration"], folder_id, selection_mode, selected_at),
                         )
                     if not con.execute(
                         "SELECT 1 FROM program_occurrence_items WHERE occurrence_id=? AND status='planned' LIMIT 1",
@@ -627,15 +627,15 @@ class ProgrammingService:
                 if weekday not in {int(x) for x in event["days"].split(",") if x.strip().isdigit()}:
                     continue
                 cursor = con.execute(
-                    "INSERT OR IGNORE INTO program_occurrences(origin_type,timeline_event_id,scheduled_for,status,program_revision_id) VALUES('timeline',?,?,'planned',?)",
-                    (int(event["id"]), scheduled_for, program_revision),
+                    "INSERT OR IGNORE INTO program_occurrences(origin_type,timeline_event_id,scheduled_for,status,operator,program_revision_id) VALUES('timeline',?,?,'planned',?,?)",
+                    (int(event["id"]), scheduled_for, operator, program_revision),
                 )
                 if cursor.rowcount:
                     occurrence_id = int(cursor.lastrowid)
                     created.append(occurrence_id)
                     con.execute(
-                        "INSERT INTO program_occurrence_items(occurrence_id,media_id,position,item_kind,title,artist,path,category,duration) VALUES(?,?,0,'media',?,?,?,?,?)",
-                        (occurrence_id, int(event["actual_media_id"]), event["media_title"], event["artist"], event["path"], event["media_category"], event["duration"]),
+                        "INSERT INTO program_occurrence_items(occurrence_id,media_id,media_id_snapshot,position,item_kind,title,artist,path,category,duration) VALUES(?,?,?,0,'media',?,?,?,?,?)",
+                        (occurrence_id, int(event["actual_media_id"]), int(event["actual_media_id"]), event["media_title"], event["artist"], event["path"], event["media_category"], event["duration"]),
                     )
                     con.execute("UPDATE timeline_events SET last_fired=? WHERE id=?", (scheduled_for, int(event["id"])))
         return created
@@ -681,7 +681,7 @@ class ProgrammingService:
 
     def _record_unplayed_occurrence(
         self, origin_type: str, source_id: int, scheduled: datetime,
-        decision: str, reason: str, now: datetime,
+        decision: str, reason: str, now: datetime, operator: str = "",
     ) -> int | None:
         """Persist an ignored/missed occurrence without selecting or advancing media rotations."""
         stamp = scheduled.strftime("%Y-%m-%d %H:%M")
@@ -702,9 +702,9 @@ class ProgrammingService:
                 if not item_rows:
                     return None
                 con.execute(
-                    "INSERT OR IGNORE INTO program_occurrences(origin_type,block_id,scheduled_for,status,transition_policy,fixed_fade_ms,dispatch_delay_ms,dispatch_reason) "
-                    "VALUES('block',?,?,'planned',?,?,?,?)",
-                    (source_id, stamp, source["transition_policy"], source["fixed_fade_ms"], delay_ms, reason),
+                    "INSERT OR IGNORE INTO program_occurrences(origin_type,block_id,scheduled_for,status,operator,transition_policy,fixed_fade_ms,dispatch_delay_ms,dispatch_reason,block_name_snapshot) "
+                    "VALUES('block',?,?,'planned',?,?,?,?,?,?)",
+                    (source_id, stamp, operator, source["transition_policy"], source["fixed_fade_ms"], delay_ms, reason, source["name"]),
                 )
                 occurrence = con.execute(
                     "SELECT id,status FROM program_occurrences WHERE block_id=? AND scheduled_for=?",
@@ -720,9 +720,9 @@ class ProgrammingService:
                     return None
                 item_rows = [source]
                 con.execute(
-                    "INSERT OR IGNORE INTO program_occurrences(origin_type,timeline_event_id,scheduled_for,status,dispatch_delay_ms,dispatch_reason) "
-                    "VALUES('timeline',?,?,'planned',?,?)",
-                    (source_id, stamp, delay_ms, reason),
+                    "INSERT OR IGNORE INTO program_occurrences(origin_type,timeline_event_id,scheduled_for,status,operator,dispatch_delay_ms,dispatch_reason) "
+                    "VALUES('timeline',?,?,'planned',?,?,?)",
+                    (source_id, stamp, operator, delay_ms, reason),
                 )
                 occurrence = con.execute(
                     "SELECT id,status FROM program_occurrences WHERE timeline_event_id=? AND scheduled_for=?",
@@ -745,25 +745,25 @@ class ProgrammingService:
                         category = str(item["category"] or source["block_type"])
                         item_kind = "folder_selection" if is_folder else str(item["item_kind"] or "media")
                         values = (
-                            occurrence_id, item["id"], media_id, item["position"], item_kind, title,
+                            occurrence_id, item["id"], media_id, media_id, item["position"], item_kind, title,
                             artist, path, category, item["duration"] or 0, item["folder_id"],
                             item["selection_mode"] or "", "ignored", ended_at, reason,
                         )
                         con.execute(
-                            "INSERT INTO program_occurrence_items(occurrence_id,source_item_id,media_id,position,item_kind,title,artist,path,category,duration,selection_folder_id,selection_mode,status,ended_at,error_message) "
-                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "INSERT INTO program_occurrence_items(occurrence_id,source_item_id,media_id,media_id_snapshot,position,item_kind,title,artist,path,category,duration,selection_folder_id,selection_mode,status,ended_at,error_message) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             values,
                         )
                     else:
                         values = (
-                            occurrence_id, source["actual_media_id"], 0, "media",
+                            occurrence_id, source["actual_media_id"], source["actual_media_id"], 0, "media",
                             str(source["media_title"] or source["title"]), str(source["artist"] or ""),
                             str(source["path"] or ""), str(source["media_category"] or source["category"]),
                             source["duration"] or 0, "ignored", ended_at, reason,
                         )
                         con.execute(
-                            "INSERT INTO program_occurrence_items(occurrence_id,media_id,position,item_kind,title,artist,path,category,duration,status,ended_at,error_message) "
-                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "INSERT INTO program_occurrence_items(occurrence_id,media_id,media_id_snapshot,position,item_kind,title,artist,path,category,duration,status,ended_at,error_message) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             values,
                         )
             con.execute(
@@ -772,9 +772,9 @@ class ProgrammingService:
                 (ended_at, reason, occurrence_id),
             )
             con.execute(
-                "UPDATE program_occurrences SET status=?,dispatch_delay_ms=?,dispatch_reason=? "
+                "UPDATE program_occurrences SET status=?,dispatch_delay_ms=?,dispatch_reason=?,operator=CASE WHEN operator='' THEN ? ELSE operator END "
                 "WHERE id=? AND status IN ('planned','delayed','interrupted')",
-                (status, delay_ms, reason, occurrence_id),
+                (status, delay_ms, reason, operator, occurrence_id),
             )
             if origin_type == "timeline":
                 con.execute("UPDATE timeline_events SET last_fired=? WHERE id=?", (stamp, source_id))
@@ -785,7 +785,7 @@ class ProgrammingService:
             return occurrence_id
 
     def _expire_unstarted_occurrences(
-        self, now: datetime, grace_seconds: int, preserve_item_id: int | None,
+        self, now: datetime, grace_seconds: int, preserve_item_id: int | None, operator: str = "",
     ) -> dict[str, list[int]]:
         cutoff = (now - timedelta(seconds=grace_seconds)).strftime("%Y-%m-%d %H:%M:%S.%f")
         fixed_cutoff = (now - timedelta(milliseconds=FIXED_LATE_GRACE_MS)).strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -816,8 +816,13 @@ class ProgrammingService:
                 ).fetchone()
                 if not active:
                     con.execute(
-                        "UPDATE program_occurrences SET status='missed',dispatch_reason=? WHERE id=?",
-                        (reason, occurrence_id),
+                        "UPDATE program_occurrences SET status='missed',dispatch_reason=?,operator=CASE WHEN operator='' THEN ? ELSE operator END WHERE id=?",
+                        (reason, operator, occurrence_id),
+                    )
+                else:
+                    con.execute(
+                        "UPDATE program_occurrences SET operator=CASE WHEN operator='' THEN ? ELSE operator END WHERE id=?",
+                        (operator, occurrence_id),
                     )
                 con.execute(
                     "INSERT OR IGNORE INTO scheduler_decisions(origin_type,source_id,scheduled_for,decision,reason) VALUES(?,?,?,?,?)",
@@ -829,7 +834,7 @@ class ProgrammingService:
 
     def dispatch_window(
         self, now: datetime, preserve_item_id: int | None = None,
-        force_recovery: bool = False,
+        force_recovery: bool = False, operator: str = "",
     ) -> dict[str, list[int] | bool]:
         """Reconcile crossed clock slots without replaying stale insertions."""
         cursor_key = "scheduler_last_checked_at"
@@ -870,7 +875,7 @@ class ProgrammingService:
         expired = {"missed_ids": [], "ignored_ids": []}
         if force_recovery or gap_seconds > SCHEDULER_LATE_GRACE_SECONDS:
             expired = self._expire_unstarted_occurrences(
-                now, SCHEDULER_LATE_GRACE_SECONDS, preserve_item_id,
+                now, SCHEDULER_LATE_GRACE_SECONDS, preserve_item_id, operator,
             )
 
         dispatch_ids: list[int] = []
@@ -918,14 +923,14 @@ class ProgrammingService:
 
             for origin_type, source_id in conflicts:
                 occurrence_id = self._record_unplayed_occurrence(
-                    origin_type, source_id, scheduled, "ignored", conflict_reason, now,
+                    origin_type, source_id, scheduled, "ignored", conflict_reason, now, operator,
                 )
                 if occurrence_id is not None:
                     ignored_ids.append(occurrence_id)
 
             if fixed_winner is not None and existing_active and ("block", fixed_winner) not in existing_sources:
                 reason = "Bloco Fixo ignorado: outra ocorrência do mesmo horário já iniciou; não se aplica corte retroativo."
-                occurrence_id = self._record_unplayed_occurrence("block", fixed_winner, scheduled, "ignored", reason, now)
+                occurrence_id = self._record_unplayed_occurrence("block", fixed_winner, scheduled, "ignored", reason, now, operator)
                 if occurrence_id is not None:
                     ignored_ids.append(occurrence_id)
                 continue
@@ -938,12 +943,12 @@ class ProgrammingService:
                     "não será executado automaticamente."
                 )
                 for source_id in sorted(winners):
-                    occurrence_id = self._record_unplayed_occurrence("block", source_id, scheduled, "missed", reason, now)
+                    occurrence_id = self._record_unplayed_occurrence("block", source_id, scheduled, "missed", reason, now, operator)
                     if occurrence_id is not None:
                         missed_ids.append(occurrence_id)
                 if not fixed_winner:
                     for source_id in sorted(event_ids):
-                        occurrence_id = self._record_unplayed_occurrence("timeline", source_id, scheduled, "missed", reason, now)
+                        occurrence_id = self._record_unplayed_occurrence("timeline", source_id, scheduled, "missed", reason, now, operator)
                         if occurrence_id is not None:
                             missed_ids.append(occurrence_id)
                 continue
@@ -956,7 +961,7 @@ class ProgrammingService:
             }
             if fixed_winner is None and not allowed_blocks and not allowed_events:
                 continue
-            self.due(scheduled, allowed_blocks, allowed_events)
+            self.due(scheduled, allowed_blocks, allowed_events, operator)
             rows = self.db.all(
                 "SELECT id,origin_type,block_id,timeline_event_id,status FROM program_occurrences WHERE scheduled_for=? ORDER BY id",
                 (stamp,),
@@ -1005,8 +1010,13 @@ class ProgrammingService:
                 reason = f"Ocorrência pendente retomada após reinicialização com atraso de {delay_ms} ms."
                 if delay_ms > 0 and row["status"] == "planned":
                     self.db.execute(
-                        "UPDATE program_occurrences SET status='delayed',dispatch_delay_ms=?,dispatch_reason=? WHERE id=?",
-                        (delay_ms, reason, occurrence_id),
+                    "UPDATE program_occurrences SET status='delayed',dispatch_delay_ms=?,dispatch_reason=?,operator=CASE WHEN operator='' THEN ? ELSE operator END WHERE id=?",
+                    (delay_ms, reason, operator, occurrence_id),
+                    )
+                else:
+                    self.db.execute(
+                        "UPDATE program_occurrences SET operator=CASE WHEN operator='' THEN ? ELSE operator END WHERE id=?",
+                        (operator, occurrence_id),
                     )
                 self._record_scheduler_decision(
                     str(row["origin_type"]), int(row["block_id"] or row["timeline_event_id"] or 0),
@@ -1065,6 +1075,106 @@ class ProgrammingService:
                 else:
                     terminal = con.execute("SELECT 1 FROM program_occurrence_items WHERE occurrence_id=? AND status NOT IN ('completed') LIMIT 1", (occurrence_id["occurrence_id"],)).fetchone()
                     con.execute("UPDATE program_occurrences SET status=? WHERE id=?", ("completed" if not terminal else "interrupted", occurrence_id["occurrence_id"]))
+
+
+class PlaybackHistoryService:
+    """Read-only operational log of player events observed by HitMo."""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    @staticmethod
+    def _validate_date(value: str, label: str) -> str:
+        value = str(value or "").strip()
+        if value:
+            try:
+                datetime.strptime(value, "%Y-%m-%d")
+            except ValueError as exc:
+                raise ValueError(f"{label} deve usar AAAA-MM-DD.") from exc
+        return value
+
+    def filter_options(self) -> dict[str, list[str]]:
+        categories = [str(row["category"]) for row in self.db.all(
+            "SELECT category FROM playback_history WHERE category<>'' UNION "
+            "SELECT category FROM program_occurrence_items WHERE category<>'' ORDER BY category COLLATE NOCASE"
+        )]
+        statuses = [str(row["status"]) for row in self.db.all(
+            "SELECT status FROM playback_history WHERE status<>'' UNION "
+            "SELECT status FROM program_occurrence_items WHERE status<>'' UNION "
+            "SELECT status FROM program_occurrences WHERE status<>'' ORDER BY status COLLATE NOCASE"
+        )]
+        return {"categories": categories, "statuses": sorted(set(statuses) | {"selected"}, key=str.casefold)}
+
+    def query(
+        self, *, start_date: str = "", end_date: str = "", material: str = "",
+        category: str = "", status: str = "", limit: int = 250, offset: int = 0,
+    ) -> dict[str, object]:
+        start_date = self._validate_date(start_date, "A data inicial")
+        end_date = self._validate_date(end_date, "A data final")
+        if start_date and end_date and start_date > end_date:
+            raise ValueError("A data inicial deve ser anterior ou igual à data final.")
+        try:
+            limit = max(1, min(int(limit), 1000))
+            offset = max(0, int(offset))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("limit e offset devem ser inteiros.") from exc
+
+        where: list[str] = []
+        params: list[object] = []
+        if start_date:
+            where.append("event_time>=?")
+            params.append(start_date)
+        if end_date:
+            end_exclusive = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+            where.append("event_time<?")
+            params.append(end_exclusive)
+        if material.strip():
+            term = material.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{term}%"
+            where.append(
+                "(title LIKE ? ESCAPE '\\' OR artist LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\' "
+                "OR CAST(material_id AS TEXT)=?)"
+            )
+            params.extend((pattern, pattern, pattern, material.strip()))
+        if category:
+            where.append("category=?")
+            params.append(category)
+        if status:
+            where.append("(status=? OR occurrence_status=? OR selection_state=?)")
+            params.extend((status, status, status))
+        filter_sql = " WHERE " + " AND ".join(where) if where else ""
+        audit = (
+            "WITH audit AS ("
+            "SELECT 'player_event' AS record_type,h.id AS id,"
+            "CASE WHEN h.started_at<>'' THEN h.started_at ELSE h.ended_at END AS event_time,"
+            "COALESCE(h.material_id_snapshot,h.media_id) AS material_id,h.title,h.artist,h.path,h.category,h.operator,"
+            "h.started_at,h.ended_at,h.played_seconds,h.status,'' AS selection_state,h.planned_for,'' AS selected_at,h.source_type,h.source_ref,h.error_message,"
+            "COALESCE(h.occurrence_id,o.id) AS occurrence_id,COALESCE(h.block_id,o.block_id) AS block_id,"
+            "COALESCE(NULLIF(h.block_name_snapshot,''),NULLIF(o.block_name_snapshot,''),'') AS block_name_snapshot,"
+            "COALESCE(o.status,'') AS occurrence_status "
+            "FROM playback_history h "
+            "LEFT JOIN program_occurrence_items oi ON oi.id=h.source_ref AND h.occurrence_id IS NULL "
+            "AND h.source_type IN ('scheduled_block','scheduled_event','timeline') "
+            "LEFT JOIN program_occurrences o ON o.id=COALESCE(h.occurrence_id,oi.occurrence_id) "
+            "UNION ALL "
+            "SELECT 'occurrence_item' AS record_type,i.id AS id,"
+            "CASE WHEN i.ended_at<>'' THEN i.ended_at WHEN i.selected_at<>'' THEN i.selected_at ELSE o.scheduled_for END AS event_time,"
+            "COALESCE(i.media_id_snapshot,i.media_id) AS material_id,i.title,i.artist,i.path,i.category,o.operator,"
+            "i.started_at,i.ended_at,0.0 AS played_seconds,i.status,"
+            "CASE WHEN i.status='planned' AND COALESCE(i.media_id_snapshot,i.media_id) IS NOT NULL THEN 'selected' ELSE '' END AS selection_state,"
+            "o.scheduled_for,i.selected_at,'program_occurrence_item',i.id,i.error_message,"
+            "o.id AS occurrence_id,o.block_id,o.block_name_snapshot,o.status AS occurrence_status "
+            "FROM program_occurrence_items i JOIN program_occurrences o ON o.id=i.occurrence_id "
+            "WHERE NOT EXISTS (SELECT 1 FROM playback_history h WHERE h.source_ref=i.id "
+            "AND (h.occurrence_id=o.id OR (h.occurrence_id IS NULL AND h.source_type IN ('scheduled_block','scheduled_event','timeline'))))"
+            ")"
+        )
+        total = int(self.db.one(audit + " SELECT COUNT(*) AS n FROM audit" + filter_sql, tuple(params))["n"])
+        rows = self.db.all(
+            audit + " SELECT * FROM audit" + filter_sql + " ORDER BY event_time DESC,record_type,id DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        )
+        return {"history": rows, "total": total, "limit": limit, "offset": offset}
 
 
 class TimelineService:

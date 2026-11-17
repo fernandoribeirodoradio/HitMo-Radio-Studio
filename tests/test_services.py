@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from hitmo.database import Database
-from hitmo.services import MediaLibrary, PlaylistService, ProgrammingService, TimelineService, media_category
+from hitmo.services import MediaLibrary, PlaybackHistoryService, PlaylistService, ProgrammingService, TimelineService, media_category
 
 
 def make_wav(path: Path, seconds: float = 0.15) -> Path:
@@ -30,6 +30,7 @@ class ServiceTests(unittest.TestCase):
         self.playlist = PlaylistService(self.db)
         self.timeline = TimelineService(self.db)
         self.programming = ProgrammingService(self.db)
+        self.history = PlaybackHistoryService(self.db)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -37,6 +38,63 @@ class ServiceTests(unittest.TestCase):
     def test_database_initializes_and_seeds_operator(self):
         rows = self.db.all("SELECT name,role FROM operators WHERE active=1")
         self.assertEqual([(r["name"], r["role"]) for r in rows], [("Operador padrão", "Administrador")])
+
+    def test_playback_history_filters_by_period_material_category_status_and_paginates(self):
+        rows = (
+            ("Oferta", "2026-11-14 23:55:00", "completed", "Comercial", 41),
+            ("Oferta reprise", "2026-11-15 00:10:00", "interrupted", "Comercial", 42),
+            ("Vinheta", "2026-11-15 08:00:00", "completed", "Vinheta", 43),
+        )
+        for title, started_at, status, category, material_id in rows:
+            self.db.execute(
+                "INSERT INTO playback_history(media_id,material_id_snapshot,title,artist,path,category,operator,started_at,ended_at,status) "
+                "VALUES(NULL,?,?,?,?,?,?,?,?,?)",
+                (material_id, title, "Artista", f"C:/Audio/{title}.wav", category, "Locutor", started_at, started_at, status),
+            )
+
+        result = self.history.query(
+            start_date="2026-11-15", end_date="2026-11-15", material="Oferta",
+            category="Comercial", status="interrupted", limit=1,
+        )
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(len(result["history"]), 1)
+        self.assertEqual((result["history"][0]["title"], result["history"][0]["material_id"]), ("Oferta reprise", 42))
+        self.assertEqual(self.history.query(status="completed", limit=1, offset=1)["total"], 2)
+
+    def test_playback_history_rejects_invalid_or_reversed_periods(self):
+        with self.assertRaisesRegex(ValueError, "AAAA-MM-DD"):
+            self.history.query(start_date="15/11/2026")
+        with self.assertRaisesRegex(ValueError, "anterior ou igual"):
+            self.history.query(start_date="2026-11-16", end_date="2026-11-15")
+
+    def test_playback_history_separates_selected_and_discarded_occurrence_items(self):
+        audio = make_wav(self.root / "audit-item.wav")
+        self.library.import_paths([audio], category="Música")
+        media_id = int(self.db.one("SELECT id FROM media") ["id"])
+        block_id = self.programming.add_block("Snapshot do bloco", "Música", "12:00", [6])
+        self.programming.add_block_item(block_id, media_id)
+        occurrence_id = self.programming.dispatch_window(
+            datetime(2026, 11, 15, 12, 0), operator="Operador da grade",
+        )["dispatch_ids"][0]
+        item_id = int(self.db.one("SELECT id FROM program_occurrence_items WHERE occurrence_id=?", (occurrence_id,))["id"])
+
+        selected = self.history.query(material=str(media_id))["history"]
+        self.assertEqual(len(selected), 1)
+        self.assertEqual((selected[0]["record_type"], selected[0]["status"], selected[0]["occurrence_status"]),
+                         ("occurrence_item", "planned", "planned"))
+        self.assertEqual(selected[0]["selection_state"], "selected")
+        selected_filter = self.history.query(material=str(media_id), status="selected")["history"]
+        self.assertEqual(len(selected_filter), 1)
+        self.assertEqual(selected[0]["operator"], "Operador da grade")
+        self.programming.set_occurrence_item_status(item_id, "discarded", "Inserção excedente")
+        discarded = self.history.query(material=str(media_id), status="discarded")["history"]
+        self.assertEqual(len(discarded), 1)
+        self.assertEqual((discarded[0]["record_type"], discarded[0]["block_name_snapshot"], discarded[0]["error_message"]),
+                         ("occurrence_item", "Snapshot do bloco", "Inserção excedente"))
+        self.assertEqual(discarded[0]["material_id"], media_id)
+        self.db.execute("DELETE FROM media WHERE id=?", (media_id,))
+        preserved = self.history.query(material=str(media_id), status="discarded")["history"]
+        self.assertEqual(preserved[0]["material_id"], media_id)
 
     def test_audio_library_hides_catalog_text_materials(self):
         self.db.execute("INSERT INTO media(path,title,category) VALUES(?,?,?)", ("hitmo://material/audio-1", "Audio", "Música"))

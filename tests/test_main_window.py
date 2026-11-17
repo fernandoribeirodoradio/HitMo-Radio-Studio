@@ -407,6 +407,49 @@ class MainWindowIntegrationTests(unittest.TestCase):
             self.assertIn("Operador padrão", dialog.list.item(0).text())
             dialog.close()
 
+    def test_playback_history_captures_occurrence_block_and_material_snapshots(self):
+        previous_data_dir = os.environ.get("HITMO_DATA_DIR")
+        with tempfile.TemporaryDirectory() as temp:
+            os.environ["HITMO_DATA_DIR"] = temp
+            window = MainWindow()
+            try:
+                window._timer.stop()
+                now = datetime(2026, 11, 15, 12, 0)
+                media_id = window.db.execute(
+                    "INSERT INTO media(path,title,artist,category) VALUES(?,?,?,?)",
+                    ("C:/shared/snapshot.wav", "Título original", "Artista original", "Música"),
+                )
+                block_id = window.programming.add_block("Bloco original", "Música", "12:00", [6])
+                window.programming.add_block_item(block_id, media_id)
+                occurrence_id = window.programming.due(now)[0]
+                item = window.db.one("SELECT * FROM program_occurrence_items WHERE occurrence_id=?", (occurrence_id,))
+                row = dict(item)
+                row["id"] = media_id
+                history_id = window._insert_playback_history(
+                    row, status="loading", source_type="scheduled_block", source_ref=int(item["id"]),
+                    scheduled_for=now.strftime("%Y-%m-%d %H:%M"), occurrence_item_id=int(item["id"]),
+                )
+
+                window.db.execute("UPDATE program_blocks SET name='Bloco renomeado' WHERE id=?", (block_id,))
+                window.db.execute("UPDATE media SET title='Título novo',category='Comercial' WHERE id=?", (media_id,))
+                history = window.history.query(material=str(media_id))["history"][0]
+
+                self.assertEqual(history["id"], history_id)
+                self.assertEqual(history["material_id"], media_id)
+                self.assertEqual((history["title"], history["artist"], history["category"]),
+                                 ("Título original", "Artista original", "Música"))
+                self.assertEqual((history["occurrence_id"], history["block_id"], history["block_name_snapshot"]),
+                                 (occurrence_id, block_id, "Bloco original"))
+                self.assertEqual(history["status"], "loading")
+            finally:
+                window.close()
+                window.deleteLater()
+                self.app.processEvents()
+        if previous_data_dir is None:
+            os.environ.pop("HITMO_DATA_DIR", None)
+        else:
+            os.environ["HITMO_DATA_DIR"] = previous_data_dir
+
     def test_central_service_controls_exist_without_server(self):
         previous_data_dir = os.environ.get("HITMO_DATA_DIR")
         def restore_data_dir():

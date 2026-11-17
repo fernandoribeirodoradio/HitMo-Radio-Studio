@@ -163,6 +163,8 @@ class Database:
                     ended_at TEXT NOT NULL DEFAULT '', played_seconds REAL NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'completed', planned_for TEXT NOT NULL DEFAULT '',
                     source_type TEXT NOT NULL DEFAULT 'manual', source_ref INTEGER,
+                    material_id_snapshot INTEGER, occurrence_id INTEGER, block_id INTEGER,
+                    block_name_snapshot TEXT NOT NULL DEFAULT '',
                     error_message TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(media_id) REFERENCES media(id) ON DELETE SET NULL
                 );
@@ -203,6 +205,7 @@ class Database:
                     fixed_fade_ms INTEGER NOT NULL DEFAULT 1000,
                     dispatch_delay_ms INTEGER NOT NULL DEFAULT 0,
                     dispatch_reason TEXT NOT NULL DEFAULT '',
+                    block_name_snapshot TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(block_id) REFERENCES program_blocks(id) ON DELETE SET NULL,
                     FOREIGN KEY(timeline_event_id) REFERENCES timeline_events(id) ON DELETE SET NULL
@@ -213,7 +216,7 @@ class Database:
                     ON program_occurrences(timeline_event_id,scheduled_for) WHERE timeline_event_id IS NOT NULL;
                 CREATE TABLE IF NOT EXISTS program_occurrence_items (
                     id INTEGER PRIMARY KEY, occurrence_id INTEGER NOT NULL, source_item_id INTEGER,
-                    media_id INTEGER, position INTEGER NOT NULL, item_kind TEXT NOT NULL DEFAULT 'media',
+                    media_id INTEGER, media_id_snapshot INTEGER, position INTEGER NOT NULL, item_kind TEXT NOT NULL DEFAULT 'media',
                     title TEXT NOT NULL DEFAULT '', artist TEXT NOT NULL DEFAULT '',
                     path TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT '', duration REAL NOT NULL DEFAULT 0,
                     selection_folder_id INTEGER, selection_mode TEXT NOT NULL DEFAULT '', selected_at TEXT NOT NULL DEFAULT '',
@@ -224,6 +227,8 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_occurrence_items_pending
                     ON program_occurrence_items(status,occurrence_id,position);
+                CREATE INDEX IF NOT EXISTS idx_occurrence_items_history
+                    ON program_occurrence_items(occurrence_id,status);
                 CREATE TABLE IF NOT EXISTS scheduler_decisions (
                     id INTEGER PRIMARY KEY,
                     origin_type TEXT NOT NULL,
@@ -271,10 +276,15 @@ class Database:
                 "planned_for": "TEXT NOT NULL DEFAULT ''",
                 "source_type": "TEXT NOT NULL DEFAULT 'manual'",
                 "source_ref": "INTEGER",
+                "material_id_snapshot": "INTEGER",
+                "occurrence_id": "INTEGER",
+                "block_id": "INTEGER",
+                "block_name_snapshot": "TEXT NOT NULL DEFAULT ''",
                 "error_message": "TEXT NOT NULL DEFAULT ''",
             },
             "program_occurrence_items": {
                 "duration": "REAL NOT NULL DEFAULT 0",
+                "media_id_snapshot": "INTEGER",
                 "selection_folder_id": "INTEGER",
                 "selection_mode": "TEXT NOT NULL DEFAULT ''",
                 "selected_at": "TEXT NOT NULL DEFAULT ''",
@@ -293,6 +303,7 @@ class Database:
                 "fixed_fade_ms": "INTEGER NOT NULL DEFAULT 1000",
                 "dispatch_delay_ms": "INTEGER NOT NULL DEFAULT 0",
                 "dispatch_reason": "TEXT NOT NULL DEFAULT ''",
+                "block_name_snapshot": "TEXT NOT NULL DEFAULT ''",
             },
             "program_blocks": {
                 "transition_policy": "TEXT NOT NULL DEFAULT 'discard_insertions'",
@@ -304,6 +315,17 @@ class Database:
             for name, declaration in additions.items():
                 if name not in present:
                     con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+        con.execute(
+            "UPDATE program_occurrence_items SET media_id_snapshot=media_id "
+            "WHERE media_id_snapshot IS NULL AND media_id IS NOT NULL"
+        )
+        con.execute(
+            "UPDATE playback_history SET material_id_snapshot=media_id "
+            "WHERE material_id_snapshot IS NULL AND media_id IS NOT NULL"
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_history_source ON playback_history(source_type,source_ref,occurrence_id)"
+        )
 
     @staticmethod
     def _install_revision_triggers(con: sqlite3.Connection) -> None:
