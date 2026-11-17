@@ -29,6 +29,16 @@ class CartouchePersistenceTests(unittest.TestCase):
             self.assertIsNone(db.one("SELECT media_id FROM cartouche_slots WHERE slot=1")["media_id"])
             self.assertEqual(db.one("SELECT id,title FROM media WHERE id=?", (media_id,))["title"], "Original")
 
+    def test_cartouche_and_loop_routes_migrate_and_persist(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = Database(Path(temp) / "hitmo.sqlite3")
+            media_id = db.execute("INSERT INTO media(path,title,category) VALUES(?,?,?)", (str(Path(temp) / "route.wav"), "Route", "Vinheta"))
+            db.execute("INSERT INTO cartouche_slots(slot,media_id,route) VALUES(1,?,'CUE')", (media_id,))
+            db.execute("INSERT INTO loop_tracks(media_id,enabled,route) VALUES(?,1,'CUE')", (media_id,))
+            reopened = Database(Path(temp) / "hitmo.sqlite3")
+            self.assertEqual(reopened.one("SELECT route FROM cartouche_slots WHERE slot=1")["route"], "CUE")
+            self.assertEqual(reopened.one("SELECT route FROM loop_tracks WHERE media_id=?", (media_id,))["route"], "CUE")
+
     def test_cartouche_history_is_in_operational_history_and_not_player_airplay_claim(self):
         with tempfile.TemporaryDirectory() as temp:
             db = Database(Path(temp) / "hitmo.sqlite3")

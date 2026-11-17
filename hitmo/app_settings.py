@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
-    QLineEdit, QVBoxLayout, QWidget,
+    QLineEdit, QMessageBox, QVBoxLayout, QWidget,
 )
 
 from .audio_engine import AudioEngine
@@ -27,12 +27,20 @@ class AppSettingsDialog(QDialog):
             self.output.addItem(device.description(), ident)
         selected = self.output.findData(db.setting("audio_output_id"))
         self.output.setCurrentIndex(max(0, selected))
+        self.cue_output = QComboBox()
+        self.cue_output.addItem("CUE desativado", "")
+        for device in AudioEngine.available_outputs():
+            ident = bytes(device.id()).decode(errors="ignore")
+            self.cue_output.addItem(device.description(), ident)
+        cue_selected = self.cue_output.findData(db.setting("cue_output_id"))
+        self.cue_output.setCurrentIndex(max(0, cue_selected))
         self.auto_advance = QCheckBox("Avançar automaticamente após concluir o item")
         self.auto_advance.setChecked(db.setting("auto_advance", "1") == "1")
         self.startup_play = QCheckBox("Iniciar reprodução ao abrir")
         self.startup_play.setChecked(db.setting("startup_play", "0") == "1")
         self.station_name = QLineEdit(db.setting("station_name", "HitMo Radio"))
         form.addRow("Saída de áudio", self.output)
+        form.addRow("Saída CUE independente", self.cue_output)
         form.addRow("Nome da emissora", self.station_name)
         form.addRow("", self.auto_advance)
         form.addRow("", self.startup_play)
@@ -44,9 +52,22 @@ class AppSettingsDialog(QDialog):
 
     def accept(self) -> None:
         output_id = str(self.output.currentData() or "")
+        cue_id = str(self.cue_output.currentData() or "")
+        selected_output = AudioEngine._device_id_for_selection(output_id)
+        if cue_id and cue_id == selected_output:
+            QMessageBox.warning(self, "Saídas incompatíveis", "PGM e CUE precisam usar dispositivos de saída distintos.")
+            return
+        try:
+            self.engine.configure_outputs(output_id, cue_id)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Saídas incompatíveis", str(exc))
+            return
+        except RuntimeError as exc:
+            QMessageBox.warning(self, "Saída indisponível", str(exc))
+            return
         self.db.set_setting("audio_output_id", output_id)
+        self.db.set_setting("cue_output_id", cue_id)
         self.db.set_setting("auto_advance", "1" if self.auto_advance.isChecked() else "0")
         self.db.set_setting("startup_play", "1" if self.startup_play.isChecked() else "0")
         self.db.set_setting("station_name", self.station_name.text().strip() or "HitMo Radio")
-        self.engine.set_output(output_id)
         super().accept()

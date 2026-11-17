@@ -136,7 +136,7 @@ class MainWindow(QMainWindow):
         self.timeline = TimelineService(self.db)
         self.programming = ProgrammingService(self.db)
         self.history = PlaybackHistoryService(self.db)
-        self.engine = AudioEngine(self.db.setting("audio_output_id"))
+        self.engine = AudioEngine(self.db.setting("audio_output_id"), self.db.setting("cue_output_id"))
         self._current = None
         self._history_id = None
         self._history_offset = 0
@@ -200,6 +200,13 @@ class MainWindow(QMainWindow):
         self._api_poll.timeout.connect(self._refresh_api_status)
         self._api_poll.start(2000)
         self._refresh_api_status()
+        self._cue_notice_timer = QTimer(self)
+        self._cue_notice_timer.setSingleShot(True)
+        self._cue_notice_timer.timeout.connect(self._show_cue_configuration_notice)
+        if self.engine.cue_configuration_error:
+            self._cue_notice_timer.start(1000)
+        elif not self.engine.cue_available:
+            self._cue_notice_timer.start(1000)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(500)
@@ -570,6 +577,7 @@ class MainWindow(QMainWindow):
         self.engine.cart_state.connect(self._cartouche_player_state)
         self.engine.cart_finished.connect(self._cartouche_finished)
         self.engine.cart_error.connect(self._cartouche_error)
+        self.engine.bus_error.connect(lambda bus, message: self.statusBar().showMessage(f"Saída {bus}: {message}", 10000))
 
     def _apply_theme(self):
         # The offscreen Qt plugin may not enumerate Windows' installed fonts.
@@ -627,13 +635,19 @@ class MainWindow(QMainWindow):
         self.operator_combo.blockSignals(False)
         self._operator_changed(self.operator_combo.currentText())
 
+    def _show_cue_configuration_notice(self):
+        if self.engine.cue_configuration_error:
+            self.statusBar().showMessage(f"CUE indisponível: {self.engine.cue_configuration_error}", 10000)
+        elif not self.engine.cue_available:
+            self.statusBar().showMessage("CUE desativado · configure uma saída diferente em Preferências", 8000)
+
     def _operator_changed(self, name: str):
         if hasattr(self, "operator_label"):
             self.operator_label.setText(f"Operador identificado: {name or 'não selecionado'}")
 
     def _refresh_cartouches(self):
         rows = self.db.all(
-            "SELECT s.slot,s.media_id,m.title,m.category,m.path,m.active,COALESCE(c.material_kind,'audio') AS material_kind "
+            "SELECT s.slot,s.media_id,s.route,m.title,m.category,m.path,m.active,COALESCE(c.material_kind,'audio') AS material_kind "
             "FROM cartouche_slots s LEFT JOIN media m ON m.id=s.media_id "
             "LEFT JOIN material_categories c ON c.name=m.category ORDER BY s.slot"
         )
@@ -691,7 +705,7 @@ class MainWindow(QMainWindow):
 
     def _fire_cartouche(self, slot: int):
         row = self.db.one(
-            "SELECT m.id,m.title,m.artist,m.path,m.category,m.active,COALESCE(c.material_kind,'audio') AS material_kind "
+            "SELECT m.id,m.title,m.artist,m.path,m.category,m.active,s.route,COALESCE(c.material_kind,'audio') AS material_kind "
             "FROM cartouche_slots s LEFT JOIN media m ON m.id=s.media_id "
             "LEFT JOIN material_categories c ON c.name=m.category WHERE s.slot=?", (slot,)
         )
@@ -710,6 +724,11 @@ class MainWindow(QMainWindow):
             return self._record_cartouche_failure(slot, snapshot, error)
         if not Path(row["path"]).is_file():
             return self._record_cartouche_failure(slot, snapshot, "Arquivo de áudio não encontrado")
+        route = str(row["route"] or "PGM").upper()
+        try:
+            self.engine.set_cartouche_route(slot, route)
+        except (RuntimeError, ValueError) as exc:
+            return self._record_cartouche_failure(slot, snapshot, str(exc))
         history_id = self.db.execute(
             "INSERT INTO cartouche_history(slot,media_id_snapshot,title,path,category,operator,status) "
             "VALUES(?,?,?,?,?,?, 'loading')",
@@ -729,9 +748,7 @@ class MainWindow(QMainWindow):
             return False
         self._cart_states[slot] = "Pronto"
         self._refresh_cartouches()
-        pgm_active = self._current is not None
-        note = "PGM mantido; a saída física segue compartilhada" if pgm_active else "saída física compartilhada"
-        self.statusBar().showMessage(f"Cartucho {slot} disparado · {row['title']} · {note}", 7000)
+        self.statusBar().showMessage(f"Cartucho {slot} disparado · {row['title']} · destino {route}", 7000)
         self._refresh_history()
         return True
 
@@ -995,9 +1012,12 @@ class MainWindow(QMainWindow):
         self.program_table.resizeColumnsToContents()
 
     def _restore_loop_tracks(self):
-        for row in self.db.all("SELECT m.path,m.title FROM loop_tracks l JOIN media m ON m.id=l.media_id WHERE l.enabled=1"):
+        for row in self.db.all("SELECT m.path,m.title,l.route FROM loop_tracks l JOIN media m ON m.id=l.media_id WHERE l.enabled=1"):
             if Path(row["path"]).is_file():
-                self.engine.start_loop(str(row["path"]))
+                try:
+                    self.engine.start_loop(str(row["path"]), str(row["route"] or "PGM"))
+                except RuntimeError as exc:
+                    self.statusBar().showMessage(f"Trilha {row['title']}: {exc}", 8000)
             else:
                 self.statusBar().showMessage(f"Trilha salva indisponível: {row['title']}", 8000)
 
@@ -1161,7 +1181,7 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"Trilha interrompida: {row['title']}", 5000)
             else:
                 self.engine.start_loop(row["path"])
-                self.db.execute("INSERT INTO loop_tracks(media_id,enabled) VALUES(?,1) ON CONFLICT(media_id) DO UPDATE SET enabled=1", (media_id,))
+                self.db.execute("INSERT INTO loop_tracks(media_id,enabled,route) VALUES(?,1,'PGM') ON CONFLICT(media_id) DO UPDATE SET enabled=1", (media_id,))
                 self.statusBar().showMessage(f"Trilha em loop: {row['title']}", 5000)
         elif action == show_file:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(row["path"]).parent)))

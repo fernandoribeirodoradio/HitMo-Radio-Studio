@@ -4,6 +4,8 @@ import unittest
 import wave
 from pathlib import Path
 
+import numpy as np
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QTimer
@@ -19,8 +21,9 @@ class AudioEngineSmokeTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def test_audio_decks_decode_and_loop_independently(self):
-        if not QMediaDevices.audioOutputs():
-            self.skipTest("Nenhuma saída de áudio disponível neste computador.")
+        outputs = QMediaDevices.audioOutputs()
+        if len(outputs) < 2:
+            self.skipTest("A pré-escuta independente exige duas saídas de áudio distintas.")
         with tempfile.TemporaryDirectory() as temp:
             def write_silence(name, frames=2000):
                 path = Path(temp) / name
@@ -38,6 +41,7 @@ class AudioEngineSmokeTests(unittest.TestCase):
             loop_b = write_silence("loop_b.wav")
 
             engine = AudioEngine()
+            engine.set_cue_output(bytes(outputs[1].id()).decode(errors="ignore"))
             def wait_ms(milliseconds):
                 wait_loop = QEventLoop()
                 QTimer.singleShot(milliseconds, wait_loop.quit)
@@ -192,6 +196,94 @@ class AudioEngineSmokeTests(unittest.TestCase):
             self.assertEqual(errors[0][0], 4)
             self.assertTrue(errors[0][1])
             self.assertFalse(engine.cartouche_active(4))
+            engine.shutdown()
+            engine.deleteLater()
+            self.app.processEvents()
+
+    def test_bus_routing_gain_mute_and_real_mix_meter_from_wav(self):
+        outputs = QMediaDevices.audioOutputs()
+        if len(outputs) < 2:
+            self.skipTest("PGM/CUE independente exige duas saídas de áudio distintas.")
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "tone.wav"
+            frames = 48000 * 3
+            tone = (np.sin(2 * np.pi * 440 * np.arange(frames) / 48000) * 0.2 * 32767).astype("<i2")
+            with wave.open(str(path), "wb") as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(48000)
+                stream.writeframes(tone.tobytes())
+            engine = AudioEngine()
+            engine.set_cue_output(bytes(outputs[1].id()).decode(errors="ignore"))
+            meters = []
+            engine.bus_meter.connect(lambda bus, peak, rms: meters.append((bus, peak, rms)))
+            engine.set_channel_route("preview", "CUE")
+            engine.preview_path(str(path))
+            self.assertTrue(self._wait_until(lambda: any(bus == "CUE" and rms > 0.01 for bus, _peak, rms in meters)))
+            pgm_meters_during_cue_only = [rms for bus, _peak, rms in meters if bus == "PGM"]
+            self.assertTrue(pgm_meters_during_cue_only)
+            self.assertTrue(all(rms == 0 for rms in pgm_meters_during_cue_only))
+            engine.play_program(str(path))
+            self.assertTrue(self._wait_until(lambda: engine.program.position() > 0))
+            initial_program_position = engine.program.position()
+            self.assertEqual(engine.program.playbackState(), QMediaPlayer.PlaybackState.PlayingState)
+            self.assertTrue(self._wait_until(lambda: engine.program.position() > initial_program_position))
+            self.assertEqual(engine.channel_route("preview"), "CUE")
+            cue_rms = max(rms for bus, _peak, rms in meters if bus == "CUE")
+            engine.set_channel_muted("preview", True)
+            engine.preview.stop()
+            engine._channels["preview"]["queue"].clear()
+            engine._channels["preview"]["queue"].push(np.full((128, 2), 0.5, dtype=np.float32))
+            muted_pcm = engine._render_bus("CUE", 128)
+            self.assertGreater(cue_rms, 0.01)
+            self.assertFalse(np.any(muted_pcm))
+            engine.set_cartouche_route(1, "CUE")
+            self.assertEqual(engine.channel_route("cart:1"), "CUE")
+            cart_start = engine.program.position()
+            self.assertTrue(engine.play_cartouche(1, str(path)))
+            self.assertTrue(self._wait_until(lambda: engine.program.position() > cart_start))
+            self.assertEqual(engine.program.playbackState(), QMediaPlayer.PlaybackState.PlayingState)
+            with self.assertRaises(ValueError):
+                engine.set_cue_output(engine.pgm_device_id)
+            engine.shutdown()
+            engine.deleteLater()
+            self.app.processEvents()
+
+    def test_twelve_cartouches_can_feed_the_pgm_mixer_simultaneously(self):
+        if not QMediaDevices.audioOutputs():
+            self.skipTest("Nenhuma saída PGM disponível neste computador.")
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "twelve.wav"
+            with wave.open(str(path), "wb") as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(8000)
+                stream.writeframes(b"\x10\x00" * 24000)
+            engine = AudioEngine()
+            try:
+                for slot in range(1, 13):
+                    self.assertTrue(engine.play_cartouche(slot, str(path)))
+                self.assertTrue(self._wait_until(lambda: all(
+                    engine._cart_players[slot][0].playbackState() == QMediaPlayer.PlaybackState.PlayingState
+                    for slot in range(1, 13)
+                ), timeout_ms=8000))
+                self.assertTrue(all(engine.cartouche_active(slot) for slot in range(1, 13)))
+            finally:
+                engine.shutdown()
+                engine.deleteLater()
+                self.app.processEvents()
+
+    def test_engine_crossfade_changes_both_source_gains(self):
+        engine = AudioEngine()
+        try:
+            engine.crossfade("program", "cart:1", 100)
+            gain_out = engine._channel_gain_for_render("program", 2)
+            gain_in = engine._channel_gain_for_render("cart:1", 2)
+            self.assertAlmostEqual(float(gain_out[0]), 1.0, places=6)
+            self.assertAlmostEqual(float(gain_in[0]), 0.0, places=6)
+            self.assertGreater(float(gain_in[-1]), float(gain_in[0]))
+            self.assertLess(float(gain_out[-1]), float(gain_out[0]))
+        finally:
             engine.shutdown()
             engine.deleteLater()
             self.app.processEvents()

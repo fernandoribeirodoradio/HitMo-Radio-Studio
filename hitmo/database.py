@@ -153,11 +153,13 @@ class Database:
                 CREATE TABLE IF NOT EXISTS loop_tracks (
                     id INTEGER PRIMARY KEY, media_id INTEGER NOT NULL UNIQUE,
                     enabled INTEGER NOT NULL DEFAULT 1,
+                    route TEXT NOT NULL DEFAULT 'PGM' CHECK(route IN ('PGM','CUE')),
                     FOREIGN KEY(media_id) REFERENCES media(id) ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS cartouche_slots (
                     slot INTEGER PRIMARY KEY CHECK(slot BETWEEN 1 AND 12),
-                    media_id INTEGER
+                    media_id INTEGER,
+                    route TEXT NOT NULL DEFAULT 'PGM' CHECK(route IN ('PGM','CUE'))
                 );
                 CREATE TABLE IF NOT EXISTS cartouche_history (
                     id INTEGER PRIMARY KEY,
@@ -328,6 +330,8 @@ class Database:
                 "transition_policy": "TEXT NOT NULL DEFAULT 'discard_insertions'",
                 "fixed_fade_ms": "INTEGER NOT NULL DEFAULT 1000",
             },
+            "loop_tracks": {"route": "TEXT NOT NULL DEFAULT 'PGM'"},
+            "cartouche_slots": {"route": "TEXT NOT NULL DEFAULT 'PGM'"},
         }
         for table, additions in columns.items():
             present = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
