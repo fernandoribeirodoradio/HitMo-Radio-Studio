@@ -890,6 +890,15 @@ class MainWindow(QMainWindow):
         self.engine.cart_finished.connect(self._cartouche_finished)
         self.engine.cart_error.connect(self._cartouche_error)
         self.engine.bus_error.connect(lambda bus, message: self.statusBar().showMessage(f"Saída {bus}: {message}", 10000))
+        self.engine.bus_status.connect(self._audio_bus_status)
+        for bus in ("PGM", "CUE"):
+            error = self.engine._buses[bus].error_message
+            if error:
+                QTimer.singleShot(0, lambda name=bus, text=error: self.statusBar().showMessage(f"Saída {name}: {text}", 10000))
+
+    def _audio_bus_status(self, bus: str, available: bool, message: str):
+        if not available:
+            self.statusBar().showMessage(f"Saída {bus}: {message}", 10000)
 
     def _apply_theme(self):
         # The offscreen Qt plugin may not enumerate Windows' installed fonts.

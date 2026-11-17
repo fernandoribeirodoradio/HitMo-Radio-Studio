@@ -90,6 +90,7 @@ class _AudioBus(QObject):
         self.sink: QAudioSink | None = None
         self.source: _SinkSource | None = None
         self.device_id = ""
+        self.error_message = ""
         self.actual_format = QAudioFormat()
         self.error.connect(engine._on_bus_error)
 
@@ -118,20 +119,24 @@ class _AudioBus(QObject):
             out_format = mix_format
         else:
             out_format = device.preferredFormat()
-        sink = QAudioSink(device, out_format, self)
+        sink = self.engine._sink_factory(device, out_format, self)
         source = _SinkSource(self.name, self.engine, out_format)
         sink.setBufferSize(max(out_format.bytesPerFrame() * 960, out_format.bytesPerFrame() * 2))
         sink.stateChanged.connect(lambda state, s=sink, b=self.name: self._state_changed(b, s, state))
         self.sink, self.source = sink, source
         self.device_id = device_id
+        self.error_message = ""
         self.actual_format = out_format
         sink.start(source)
 
     def _state_changed(self, bus: str, sink: QAudioSink, state) -> None:
         if sink is not self.sink or not _qt_object_is_valid(sink):
             return
-        if sink.error() != QAudio.Error.NoError:
-            self.error.emit(bus, f"Saída {bus}: {sink.error().name}")
+        sink_error = sink.error()
+        # PySide6 may wrap a Qt enum value in a distinct Python enum object;
+        # compare its integral value instead of relying on wrapper identity.
+        if sink_error.value != QAudio.Error.NoError.value:
+            self.error.emit(bus, f"Saída {bus}: {sink_error.name}")
 
 
 class AudioEngine(QObject):
@@ -154,9 +159,10 @@ class AudioEngine(QObject):
     cart_error = Signal(int, str)
     bus_meter = Signal(str, float, float)
     bus_error = Signal(str, str)
+    bus_status = Signal(str, bool, str)
     routing_changed = Signal(str, str)
 
-    def __init__(self, output_id: str = "", cue_output_id: str = ""):
+    def __init__(self, output_id: str = "", cue_output_id: str = "", *, device_provider=None, sink_factory=None):
         super().__init__()
         self._lock = RLock()
         self._channels: dict[str, dict] = {}
@@ -165,9 +171,15 @@ class AudioEngine(QObject):
         self._bus_mutes = {"PGM": False, "CUE": False}
         self._master_gain = DEFAULT_MASTER_GAIN
         self._crossfades: dict[str, dict] = {}
+        self._device_provider = device_provider or QMediaDevices.audioOutputs
+        self._sink_factory = sink_factory or (lambda device, fmt, parent: QAudioSink(device, fmt, parent))
+        self._requested_device_ids = {"PGM": output_id or "", "CUE": cue_output_id or ""}
+        self._paused_for_bus_loss: dict[str, set[str]] = {"PGM": set(), "CUE": set()}
         self._player_channels: dict[int, str] = {}
         self._end_generations: dict[str, int] = {}
         self._buses = {name: _AudioBus(name, self) for name in ("PGM", "CUE")}
+        self._media_devices = QMediaDevices(self)
+        self._media_devices.audioOutputsChanged.connect(self.refresh_audio_devices)
         self.program_output = _ChannelControl(self, "program", "PGM")
         self.preview_output = _ChannelControl(self, "preview", "CUE")
         self.program = QMediaPlayer(self)
@@ -200,13 +212,7 @@ class AudioEngine(QObject):
         self.preview.positionChanged.connect(lambda p: self.preview_position.emit(p, self.preview.duration()))
         self.program.mediaStatusChanged.connect(self._program_media_status)
         self.preview.mediaStatusChanged.connect(self._preview_media_status)
-        self.set_output(output_id)
-        if cue_output_id:
-            try:
-                if not self.set_cue_output(cue_output_id):
-                    self.cue_configuration_error = "O dispositivo CUE salvo não está disponível."
-            except ValueError as exc:
-                self.cue_configuration_error = str(exc)
+        self._configure_initial_outputs()
 
     def _create_player_channel(self, channel_id: str, player: QMediaPlayer, bus: str) -> _ChannelControl:
         fmt = QAudioFormat()
@@ -299,7 +305,7 @@ class AudioEngine(QObject):
         return b"\x00" * (len(pcm) * max(1, fmt.bytesPerFrame()))
 
     def _on_bus_error(self, bus: str, message: str) -> None:
-        self.bus_error.emit(bus, message)
+        self._mark_bus_unavailable(bus, message)
 
     def _finish_after_output_drain(self, channel_id: str, player: QMediaPlayer, callback) -> None:
         generation = self._end_generations.get(channel_id, 0) + 1
@@ -336,28 +342,37 @@ class AudioEngine(QObject):
         QTimer.singleShot(10, check_queue)
 
     def _resolve_device(self, device_id: str):
-        devices = QMediaDevices.audioOutputs()
+        devices = list(self._device_provider())
         if device_id:
             return next((d for d in devices if bytes(d.id()).decode(errors="ignore") == device_id), None)
-        return QMediaDevices.defaultAudioOutput()
+        default = QMediaDevices.defaultAudioOutput()
+        return default if not default.isNull() else (devices[0] if devices else None)
 
     @classmethod
     def _device_id_for_selection(cls, device_id: str) -> str:
-        device = cls._resolve_device(device_id)
+        devices = QMediaDevices.audioOutputs()
+        device = next((d for d in devices if bytes(d.id()).decode(errors="ignore") == device_id), None) if device_id else QMediaDevices.defaultAudioOutput()
         return bytes(device.id()).decode(errors="ignore") if device and not device.isNull() else ""
 
     def set_output(self, device_id: str) -> None:
         device = self._resolve_device(device_id)
         if device is None or device.isNull():
-            outputs = QMediaDevices.audioOutputs()
-            device = outputs[0] if outputs else None
-        if device is None:
+            self._requested_device_ids["PGM"] = str(device_id or "")
+            self._mark_bus_unavailable("PGM", "A saída PGM selecionada não está disponível.")
             return
         ident = bytes(device.id()).decode(errors="ignore")
         cue = self._buses["CUE"]
         if cue.device_id and cue.device_id == ident:
             raise ValueError("PGM e CUE precisam usar dispositivos de saída distintos.")
-        self._buses["PGM"].configure(device, ident)
+        self._requested_device_ids["PGM"] = str(device_id or "")
+        try:
+            self._buses["PGM"].configure(device, ident)
+        except Exception as exc:
+            self._mark_bus_unavailable("PGM", f"Falha ao iniciar saída PGM: {exc}")
+            return
+        if self._buses["PGM"].sink is None:
+            raise RuntimeError("A saída PGM não foi iniciada.")
+        self.bus_status.emit("PGM", True, "")
 
     def configure_outputs(self, pgm_device_id: str, cue_device_id: str) -> None:
         if any(
@@ -376,27 +391,51 @@ class AudioEngine(QObject):
         cue_id = bytes(cue.id()).decode(errors="ignore") if cue else ""
         if cue_id and cue_id == pgm_id:
             raise ValueError("PGM e CUE precisam usar dispositivos de saída distintos.")
-        # Validation precedes either mutation, avoiding partial routing changes.
-        self._buses["CUE"].close()
-        self._buses["PGM"].configure(pgm, pgm_id)
-        if cue:
-            self._buses["CUE"].configure(cue, cue_id)
+        # Validation precedes mutation; on backend failure restore the previous
+        # selections when possible and keep their IDs as the desired endpoints.
+        previous = self._requested_device_ids.copy()
+        try:
+            self.set_output(pgm_device_id)
+            if not self.set_cue_output(cue_device_id):
+                raise RuntimeError("O dispositivo CUE selecionado não iniciou.")
+            if cue_device_id and self._buses["CUE"].sink is None:
+                raise RuntimeError("A saída CUE não foi iniciada.")
+        except Exception:
+            try:
+                self.set_output(previous["PGM"])
+                self.set_cue_output(previous["CUE"])
+            except Exception:
+                self._requested_device_ids = previous
+            raise
 
     def set_cue_output(self, device_id: str) -> bool:
         if not device_id:
+            self._requested_device_ids["CUE"] = ""
             self._buses["CUE"].close()
             self.cue_configuration_error = ""
+            self.bus_status.emit("CUE", False, "Saída CUE desativada.")
             return True
         device = self._resolve_device(device_id)
         if device is None or device.isNull():
+            self._requested_device_ids["CUE"] = str(device_id)
             self._buses["CUE"].close()
             self.cue_configuration_error = "O dispositivo CUE salvo não está disponível."
+            self._buses["CUE"].error_message = self.cue_configuration_error
+            self.bus_status.emit("CUE", False, self.cue_configuration_error)
             return False
         ident = bytes(device.id()).decode(errors="ignore")
         if ident == self._buses["PGM"].device_id:
             raise ValueError("PGM e CUE precisam usar dispositivos de saída distintos.")
-        self._buses["CUE"].configure(device, ident)
+        self._requested_device_ids["CUE"] = str(device_id)
+        try:
+            self._buses["CUE"].configure(device, ident)
+        except Exception as exc:
+            self._mark_bus_unavailable("CUE", f"Falha ao iniciar saída CUE: {exc}")
+            return False
+        if self._buses["CUE"].sink is None:
+            raise RuntimeError("A saída CUE não foi iniciada.")
         self.cue_configuration_error = ""
+        self.bus_status.emit("CUE", True, "")
         return True
 
     @property
@@ -500,6 +539,61 @@ class AudioEngine(QObject):
     @staticmethod
     def available_outputs():
         return QMediaDevices.audioOutputs()
+
+    def _configure_initial_outputs(self) -> None:
+        self.set_output(self._requested_device_ids["PGM"])
+        if self._requested_device_ids["CUE"]:
+            self.set_cue_output(self._requested_device_ids["CUE"])
+
+    def _mark_bus_unavailable(self, bus: str, message: str) -> None:
+        bus = bus.upper()
+        target = self._buses[bus]
+        if target.sink is None and target.error_message == message:
+            return
+        target.close()
+        target.error_message = message
+        with self._lock:
+            for channel_id, channel in self._channels.items():
+                if self._routes.get(channel_id) == bus and channel["player"].playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                    self._paused_for_bus_loss[bus].add(channel_id)
+                    channel["player"].pause()
+                    channel["queue"].clear()
+        if bus == "CUE":
+            self.cue_configuration_error = message
+        self.bus_error.emit(bus, message)
+        self.bus_status.emit(bus, False, message)
+
+    def refresh_audio_devices(self) -> None:
+        """Rebind configured buses after Windows reports output-device changes."""
+        for bus in ("PGM", "CUE"):
+            requested = self._requested_device_ids[bus]
+            if bus == "CUE" and not requested:
+                continue
+            device = self._resolve_device(requested)
+            if device is None or device.isNull():
+                self._mark_bus_unavailable(bus, f"A saída {bus} selecionada não está disponível.")
+                continue
+            ident = bytes(device.id()).decode(errors="ignore")
+            other = "CUE" if bus == "PGM" else "PGM"
+            if self._buses[other].sink is not None and ident == self._buses[other].device_id:
+                self._mark_bus_unavailable(bus, "PGM e CUE precisam usar dispositivos de saída distintos.")
+                continue
+            if self._buses[bus].sink is None or self._buses[bus].device_id != ident:
+                try:
+                    self._buses[bus].configure(device, ident)
+                except Exception as exc:
+                    self._mark_bus_unavailable(bus, f"Falha ao iniciar saída {bus}: {exc}")
+                    continue
+            self._buses[bus].error_message = ""
+            if bus == "CUE":
+                self.cue_configuration_error = ""
+            self.bus_status.emit(bus, True, "")
+            paused = self._paused_for_bus_loss[bus].copy()
+            self._paused_for_bus_loss[bus].clear()
+            for channel_id in paused:
+                channel = self._channels.get(channel_id)
+                if channel and channel["player"].playbackState() == QMediaPlayer.PlaybackState.PausedState:
+                    channel["player"].play()
 
     def _cart_error(self, slot: int, message: str) -> None:
         self._cart_active.discard(slot)
