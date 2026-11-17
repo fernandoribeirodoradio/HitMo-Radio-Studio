@@ -283,6 +283,28 @@ class AudioEngineSmokeTests(unittest.TestCase):
             self.assertAlmostEqual(float(gain_in[0]), 0.0, places=6)
             self.assertGreater(float(gain_in[-1]), float(gain_in[0]))
             self.assertLess(float(gain_out[-1]), float(gain_out[0]))
+            engine.crossfade("program", "cart:1", 1)
+            engine._channel_gain_for_render("program", 48)
+            engine._channel_gain_for_render("cart:1", 48)
+            self.assertEqual(engine.channel_gain("program"), 1.0)
+            self.assertTrue(np.all(engine._channel_gain_for_render("program", 4) == 0))
+            self.assertTrue(np.all(engine._channel_gain_for_render("cart:1", 4) == 1))
+            engine.set_channel_gain("program", 0.7)
+            self.assertEqual(engine._channel_gain_for_render("program", 4), 0.7)
+        finally:
+            engine.shutdown()
+            engine.deleteLater()
+            self.app.processEvents()
+
+    def test_fixed_program_and_preview_routes_cannot_be_crossed(self):
+        engine = AudioEngine()
+        try:
+            with self.assertRaises(ValueError):
+                engine.set_channel_route("program", "CUE")
+            with self.assertRaises(ValueError):
+                engine.set_channel_route("preview", "PGM")
+            self.assertEqual(engine.channel_route("program"), "PGM")
+            self.assertEqual(engine.channel_route("preview"), "CUE")
         finally:
             engine.shutdown()
             engine.deleteLater()

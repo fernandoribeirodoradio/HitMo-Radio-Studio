@@ -263,12 +263,15 @@ class AudioEngine(QObject):
         base = self._channels[channel_id]["gain"]
         if not fade:
             return base
+        if fade.get("finished"):
+            final_gain = 0.0 if fade["direction"] == "out" else 1.0
+            return np.full(frames, base * final_gain, dtype=np.float32)
         start, total, direction = fade["position"], fade["total"], fade["direction"]
         a, b = equal_power_crossfade(frames, start, total)
         envelope = b if direction == "in" else a
         fade["position"] = min(total, start + frames)
         if fade["position"] >= total:
-            self._crossfades.pop(channel_id, None)
+            fade["finished"] = True
         return envelope * base
 
     @staticmethod
@@ -327,8 +330,8 @@ class AudioEngine(QObject):
                 check_queue()
                 return
             self._end_generations[channel_id] += 1
-            callback()
             player.setSource(QUrl())
+            callback()
 
         QTimer.singleShot(10, check_queue)
 
@@ -357,6 +360,12 @@ class AudioEngine(QObject):
         self._buses["PGM"].configure(device, ident)
 
     def configure_outputs(self, pgm_device_id: str, cue_device_id: str) -> None:
+        if any(
+            channel["player"].playbackState() != QMediaPlayer.PlaybackState.StoppedState
+            or channel["queue"].queued_frames
+            for channel in self._channels.values()
+        ):
+            raise RuntimeError("Pare todas as fontes antes de reconfigurar saídas de áudio.")
         pgm = self._resolve_device(pgm_device_id)
         cue = self._resolve_device(cue_device_id) if cue_device_id else None
         if pgm is None or pgm.isNull():
@@ -406,6 +415,9 @@ class AudioEngine(QObject):
         bus = bus.upper()
         if bus not in self._buses:
             raise ValueError("O destino deve ser PGM ou CUE.")
+        fixed_routes = {"program": "PGM", "preview": "CUE"}
+        if channel_id in fixed_routes and bus != fixed_routes[channel_id]:
+            raise ValueError(f"A fonte {channel_id} permanece no barramento {fixed_routes[channel_id]}.")
         if bus == "CUE" and not self.cue_available:
             raise RuntimeError("CUE indisponível: configure uma saída física diferente da saída PGM.")
         with self._lock:
@@ -433,6 +445,7 @@ class AudioEngine(QObject):
     def set_channel_gain(self, channel_id: str, gain: float) -> None:
         with self._lock:
             self._channels[channel_id]["gain"] = min(1.0, max(0.0, float(gain)))
+            self._crossfades.pop(channel_id, None)
         self._channels[channel_id]["control"].volumeChanged.emit(float(gain))
 
     def channel_gain(self, channel_id: str) -> float:
@@ -463,6 +476,19 @@ class AudioEngine(QObject):
         with self._lock:
             self._master_gain = min(1.0, max(0.0, float(gain)))
 
+    @property
+    def master_gain(self) -> float:
+        return float(self._master_gain)
+
+    def active_sources(self, bus: str) -> list[str]:
+        bus = bus.upper()
+        with self._lock:
+            return [
+                source_id for source_id, channel in self._channels.items()
+                if self._routes.get(source_id) == bus
+                and channel["player"].playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            ]
+
     def crossfade(self, source_a: str, source_b: str, duration_ms: int) -> None:
         if self._routes.get(source_a) != self._routes.get(source_b):
             raise ValueError("As fontes do crossfade devem estar no mesmo barramento.")
@@ -478,6 +504,7 @@ class AudioEngine(QObject):
     def _cart_error(self, slot: int, message: str) -> None:
         self._cart_active.discard(slot)
         self._end_generations[f"cart:{slot}"] += 1
+        self._crossfades.pop(f"cart:{slot}", None)
         player, _output = self._cart_players[slot]
         details = message or player.errorString() or "Falha ao abrir o áudio."
         player.stop()
@@ -507,6 +534,7 @@ class AudioEngine(QObject):
             return False
         self._cart_active.add(slot)
         self._end_generations[f"cart:{slot}"] += 1
+        self._crossfades.pop(f"cart:{slot}", None)
         self._channels[f"cart:{slot}"]["queue"].clear()
         self._load(player, path)
         return True
@@ -531,6 +559,7 @@ class AudioEngine(QObject):
         self._cart_active.discard(slot)
         if was_active or player.source().isValid():
             self._end_generations[f"cart:{slot}"] += 1
+            self._crossfades.pop(f"cart:{slot}", None)
             player.stop()
             player.setSource(QUrl())
             self._channels[f"cart:{slot}"]["queue"].clear()
@@ -586,6 +615,7 @@ class AudioEngine(QObject):
     def play_program(self, path: str) -> None:
         self.cancel_program_fade()
         self._end_generations["program"] += 1
+        self._crossfades.pop("program", None)
         self._channels["program"]["queue"].clear()
         self._load(self.program, path)
 
@@ -605,12 +635,14 @@ class AudioEngine(QObject):
     def stop_program(self) -> None:
         self.cancel_program_fade()
         self._end_generations["program"] += 1
+        self._crossfades.pop("program", None)
         self.program.stop()
         self._channels["program"]["queue"].clear()
 
     def eject_program(self) -> None:
         self.cancel_program_fade()
         self._end_generations["program"] += 1
+        self._crossfades.pop("program", None)
         self.program.stop()
         self.program.setSource(QUrl())
         self._channels["program"]["queue"].clear()
@@ -626,6 +658,7 @@ class AudioEngine(QObject):
             position = self.program.position()
             self.program.stop()
             self._end_generations["program"] += 1
+            self._crossfades.pop("program", None)
             self._channels["program"]["queue"].clear()
             self.program_faded_out.emit(position)
             return
@@ -644,6 +677,7 @@ class AudioEngine(QObject):
         self._program_fade_timer.stop()
         self.program.stop()
         self._end_generations["program"] += 1
+        self._crossfades.pop("program", None)
         self._channels["program"]["queue"].clear()
         self.program_output.setVolume(self._program_fade_start_volume)
         self.program_faded_out.emit(position)
@@ -662,10 +696,12 @@ class AudioEngine(QObject):
             return
         self._channels["preview"]["queue"].clear()
         self._end_generations["preview"] += 1
+        self._crossfades.pop("preview", None)
         self._load(self.preview, path)
 
     def stop_preview(self) -> None:
         self._end_generations["preview"] += 1
+        self._crossfades.pop("preview", None)
         self.preview.stop()
         self.preview.setSource(QUrl())
         self._channels["preview"]["queue"].clear()

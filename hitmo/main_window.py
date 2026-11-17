@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import ipaddress
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -14,8 +15,8 @@ from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QIcon, QKeySe
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDateEdit, QDockWidget, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QInputDialog,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
-    QMessageBox, QProgressBar, QPushButton, QStyle, QTableWidget, QTableWidgetItem,
+    QGroupBox, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
+    QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox, QStyle, QTableWidget, QTableWidgetItem,
     QTimeEdit, QVBoxLayout, QWidget,
 )
 
@@ -461,7 +462,7 @@ class MainWindow(QMainWindow):
         cart_panel = QWidget()
         cart_layout = QVBoxLayout(cart_panel)
         cart_layout.setContentsMargins(8, 8, 8, 8)
-        cart_layout.addWidget(QLabel("Cartuchos locais · saída de áudio compartilhada; não confirma transmissão."))
+        cart_layout.addWidget(QLabel("Cartuchos locais · destinos PGM/CUE · execução do software não comprova transmissão."))
         self.cart_grid = QGridLayout()
         self.cart_grid.setSpacing(8)
         self.cart_slots = {}
@@ -516,10 +517,12 @@ class MainWindow(QMainWindow):
         self.cart_dock.setObjectName("cartoucheDock")
         self.cart_dock.setWidget(cart_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.cart_dock)
+        self._build_audio_console()
         self.tabifyDockWidget(self.timeline_dock, self.history_dock)
         self.tabifyDockWidget(self.history_dock, self.cart_dock)
         self.tabifyDockWidget(self.program_dock, self.timeline_dock)
-        self.cart_dock.raise_()
+        self.tabifyDockWidget(self.cart_dock, self.console_dock)
+        self.console_dock.raise_()
 
         self._build_menus()
         self.history_period_enabled.toggled.connect(self._toggle_history_period)
@@ -531,6 +534,312 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self._start_or_resume)
         QShortcut(QKeySequence("Ctrl+Right"), self, activated=self.play_next)
         QShortcut(QKeySequence("Ctrl+M"), self, activated=lambda: self.mute_button.toggle())
+
+    def _build_audio_console(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        self.output_summary = QLabel()
+        self.output_summary.setWordWrap(True)
+        layout.addWidget(self.output_summary)
+        self.program_audio_state = QLabel("PGM · parado")
+        self.cue_audio_state = QLabel("CUE · parado")
+        states = QHBoxLayout()
+        states.addWidget(self.program_audio_state)
+        states.addWidget(self.cue_audio_state)
+        layout.addLayout(states)
+
+        self.bus_widgets = {}
+        bus_row = QHBoxLayout()
+        for bus in ("PGM", "CUE"):
+            group = QGroupBox(bus)
+            group_layout = QVBoxLayout(group)
+            meter = QProgressBar()
+            meter.setRange(0, 600)
+            meter.setTextVisible(False)
+            meter.setFixedHeight(18)
+            meter.setStyleSheet("QProgressBar::chunk { background:#63d6a5; }" if bus == "PGM" else "QProgressBar::chunk { background:#60a8ff; }")
+            level = QLabel("Pico −60 dBFS · RMS −60 dBFS")
+            gain = QSlider(Qt.Orientation.Horizontal)
+            gain.setRange(0, 100)
+            gain.setValue(round(self.engine.bus_gain(bus) * 100))
+            mute = QCheckBox(f"Silenciar barramento {bus}")
+            gain.valueChanged.connect(lambda value, target=bus: self.engine.set_bus_gain(target, value / 100))
+            mute.toggled.connect(lambda checked, target=bus: self.engine.set_bus_muted(target, checked))
+            group_layout.addWidget(meter)
+            group_layout.addWidget(level)
+            group_layout.addWidget(QLabel("Ganho do barramento"))
+            group_layout.addWidget(gain)
+            group_layout.addWidget(mute)
+            bus_row.addWidget(group)
+            self.bus_widgets[bus] = {"meter": meter, "level": level, "gain": gain, "mute": mute}
+        layout.addLayout(bus_row)
+
+        master_row = QHBoxLayout()
+        master_row.addWidget(QLabel("Master"))
+        self.master_gain_slider = QSlider(Qt.Orientation.Horizontal)
+        self.master_gain_slider.setRange(0, 100)
+        self.master_gain_slider.setValue(round(self.engine.master_gain * 100))
+        self.master_gain_value = QLabel(f"{self.engine.master_gain:.2f}")
+        self.master_gain_slider.valueChanged.connect(self._master_gain_changed)
+        master_row.addWidget(self.master_gain_slider, 1)
+        master_row.addWidget(self.master_gain_value)
+        layout.addLayout(master_row)
+
+        source_row = QHBoxLayout()
+        self.program_channel_gain = QSlider(Qt.Orientation.Horizontal)
+        self.program_channel_gain.setRange(0, 100)
+        self.program_channel_gain.setValue(round(self.engine.channel_gain("program") * 100))
+        self.program_channel_gain.valueChanged.connect(lambda value: self.engine.set_channel_gain("program", value / 100))
+        self.program_channel_mute = QCheckBox("Mute player PGM")
+        self.program_channel_mute.toggled.connect(self._toggle_mute)
+        self.preview_channel_gain = QSlider(Qt.Orientation.Horizontal)
+        self.preview_channel_gain.setRange(0, 100)
+        self.preview_channel_gain.setValue(round(self.engine.channel_gain("preview") * 100))
+        self.preview_channel_gain.valueChanged.connect(lambda value: self.engine.set_channel_gain("preview", value / 100))
+        self.preview_channel_mute = QCheckBox("Mute pré-escuta")
+        self.preview_channel_mute.toggled.connect(lambda checked: self.engine.set_channel_muted("preview", checked))
+        source_row.addWidget(QLabel("Canal player PGM"))
+        source_row.addWidget(self.program_channel_gain, 1)
+        source_row.addWidget(self.program_channel_mute)
+        source_row.addWidget(QLabel("Canal pré-escuta CUE"))
+        source_row.addWidget(self.preview_channel_gain, 1)
+        source_row.addWidget(self.preview_channel_mute)
+        layout.addLayout(source_row)
+
+        layout.addWidget(QLabel("Cartuchos · destino, ganho e mute por fonte"))
+        self.cart_mixer_table = QTableWidget(12, 5)
+        self.cart_mixer_table.setHorizontalHeaderLabels(["Posição", "Material", "Destino", "Ganho", "Mute"])
+        self.cart_mixer_table.horizontalHeader().setStretchLastSection(True)
+        self.cart_mixer_table.setMinimumHeight(270)
+        layout.addWidget(self.cart_mixer_table)
+
+        layout.addWidget(QLabel("Trilhas em loop · destino salvo, ganho e mute"))
+        self.loop_mixer_table = QTableWidget(0, 5)
+        self.loop_mixer_table.setHorizontalHeaderLabels(["Trilha", "Destino", "Ganho", "Mute", "Controle"])
+        self.loop_mixer_table.horizontalHeader().setStretchLastSection(True)
+        self.loop_mixer_table.setMaximumHeight(190)
+        layout.addWidget(self.loop_mixer_table)
+
+        fade_row = QHBoxLayout()
+        fade_row.addWidget(QLabel("Crossfade entre fontes ativas"))
+        self.crossfade_bus = QComboBox()
+        self.crossfade_bus.addItems(["PGM", "CUE"])
+        self.crossfade_bus.currentTextChanged.connect(self._populate_crossfade_sources)
+        self.crossfade_source_a = QComboBox()
+        self.crossfade_source_b = QComboBox()
+        self.crossfade_duration = QSpinBox()
+        self.crossfade_duration.setRange(100, 15000)
+        self.crossfade_duration.setValue(3000)
+        self.crossfade_duration.setSuffix(" ms")
+        self.crossfade_button = QPushButton("Aplicar")
+        self.crossfade_button.clicked.connect(self._apply_crossfade)
+        fade_row.addWidget(self.crossfade_bus)
+        fade_row.addWidget(self.crossfade_source_a, 1)
+        fade_row.addWidget(self.crossfade_source_b, 1)
+        fade_row.addWidget(self.crossfade_duration)
+        fade_row.addWidget(self.crossfade_button)
+        layout.addLayout(fade_row)
+        layout.addWidget(QLabel("Medidores mostram amostras do mixer após ganho e limitador; não comprovam transmissão."))
+
+        self.console_dock = QDockWidget("Console de áudio · PGM / CUE", self)
+        self.console_dock.setObjectName("audioConsoleDock")
+        self.console_dock.setWidget(panel)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.console_dock)
+        self._refresh_audio_console()
+
+    def _master_gain_changed(self, value: int):
+        self.engine.set_master_gain(value / 100)
+        self.master_gain_value.setText(f"{value / 100:.2f}")
+
+    def _route_combo(self, current: str) -> QComboBox:
+        combo = QComboBox()
+        combo.addItem("PGM", "PGM")
+        cue_label = "CUE" if self.engine.cue_available else "CUE · sem saída"
+        combo.addItem(cue_label, "CUE")
+        if not self.engine.cue_available:
+            combo.model().item(1).setEnabled(False)
+        combo.setCurrentIndex(max(0, combo.findData(current)))
+        return combo
+
+    def _refresh_audio_console(self):
+        if not hasattr(self, "cart_mixer_table"):
+            return
+        self.master_gain_slider.blockSignals(True)
+        self.master_gain_slider.setValue(round(self.engine.master_gain * 100))
+        self.master_gain_slider.blockSignals(False)
+        self.master_gain_value.setText(f"{self.engine.master_gain:.2f}")
+        self.program_channel_gain.blockSignals(True)
+        self.program_channel_gain.setValue(round(self.engine.channel_gain("program") * 100))
+        self.program_channel_gain.blockSignals(False)
+        self.preview_channel_gain.blockSignals(True)
+        self.preview_channel_gain.setValue(round(self.engine.channel_gain("preview") * 100))
+        self.preview_channel_gain.blockSignals(False)
+        for bus, widgets in self.bus_widgets.items():
+            widgets["gain"].blockSignals(True)
+            widgets["gain"].setValue(round(self.engine.bus_gain(bus) * 100))
+            widgets["gain"].blockSignals(False)
+            widgets["mute"].blockSignals(True)
+            widgets["mute"].setChecked(self.engine.bus_muted(bus))
+            widgets["mute"].blockSignals(False)
+        self.program_channel_mute.blockSignals(True)
+        self.program_channel_mute.setChecked(self.engine.channel_muted("program"))
+        self.program_channel_mute.blockSignals(False)
+        self.preview_channel_mute.blockSignals(True)
+        self.preview_channel_mute.setChecked(self.engine.channel_muted("preview"))
+        self.preview_channel_mute.blockSignals(False)
+        pgm_name = self._output_name(self.engine.pgm_device_id) or "sem saída"
+        cue_name = self._output_name(self.engine.cue_device_id) if self.engine.cue_available else "desativado · requer outra saída física"
+        self.output_summary.setText(f"PGM → {pgm_name}    |    CUE → {cue_name}")
+        self.program_audio_state.setText(f"PGM · {self._player_state_text(self.engine.program.playbackState())}")
+        self.cue_audio_state.setText(f"CUE · {self._player_state_text(self.engine.preview.playbackState())}")
+
+        self.cart_mixer_table.setRowCount(12)
+        for slot in range(1, 13):
+            row = self.db.one(
+                "SELECT s.media_id,s.route,m.title FROM cartouche_slots s LEFT JOIN media m ON m.id=s.media_id WHERE s.slot=?",
+                (slot,),
+            )
+            material = str(row["title"] or "Vazio") if row else "Vazio"
+            route = str(row["route"] or "PGM") if row else "PGM"
+            self.cart_mixer_table.setItem(slot - 1, 0, QTableWidgetItem(f"{slot:02}"))
+            self.cart_mixer_table.setItem(slot - 1, 1, QTableWidgetItem(material))
+            route_combo = self._route_combo(route)
+            player = self.engine._cart_players[slot][0]
+            route_combo.setEnabled(not self.engine.cartouche_active(slot) and not player.source().isValid())
+            route_combo.currentIndexChanged.connect(lambda _index, number=slot, widget=route_combo: self._set_cart_mixer_route(number, str(widget.currentData())))
+            self.cart_mixer_table.setCellWidget(slot - 1, 2, route_combo)
+            gain = QSlider(Qt.Orientation.Horizontal)
+            gain.setRange(0, 100)
+            gain.setValue(round(self.engine.channel_gain(f"cart:{slot}") * 100))
+            gain.valueChanged.connect(lambda value, number=slot: self.engine.set_channel_gain(f"cart:{number}", value / 100))
+            self.cart_mixer_table.setCellWidget(slot - 1, 3, gain)
+            mute = QCheckBox("Mute")
+            mute.setChecked(self.engine.channel_muted(f"cart:{slot}"))
+            mute.toggled.connect(lambda checked, number=slot: self.engine.set_channel_muted(f"cart:{number}", checked))
+            self.cart_mixer_table.setCellWidget(slot - 1, 4, mute)
+
+        loop_rows = self.db.all(
+            "SELECT l.media_id,l.route,l.enabled,m.path,m.title FROM loop_tracks l JOIN media m ON m.id=l.media_id ORDER BY m.title COLLATE NOCASE"
+        )
+        self.loop_mixer_table.setRowCount(len(loop_rows))
+        for index, row in enumerate(loop_rows):
+            path = str(row["path"])
+            source_id = f"loop:{self.engine._loop_key(path)}"
+            active = self.engine.loop_active(path)
+            self.loop_mixer_table.setItem(index, 0, QTableWidgetItem(str(row["title"])))
+            route_combo = self._route_combo(str(row["route"] or "PGM"))
+            route_combo.setEnabled(not active)
+            route_combo.currentIndexChanged.connect(lambda _index, media=int(row["media_id"]), widget=route_combo: self._set_loop_mixer_route(media, str(widget.currentData())))
+            self.loop_mixer_table.setCellWidget(index, 1, route_combo)
+            gain = QSlider(Qt.Orientation.Horizontal)
+            gain.setRange(0, 100)
+            gain.setValue(round(self.engine.channel_gain(source_id) * 100) if active else 100)
+            gain.setEnabled(active)
+            gain.valueChanged.connect(lambda value, media_path=path: self.engine.set_channel_gain(f"loop:{self.engine._loop_key(media_path)}", value / 100))
+            self.loop_mixer_table.setCellWidget(index, 2, gain)
+            mute = QCheckBox("Mute")
+            mute.setEnabled(active)
+            mute.setChecked(self.engine.channel_muted(source_id) if active else False)
+            mute.toggled.connect(lambda checked, channel=source_id: self.engine.set_channel_muted(channel, checked))
+            self.loop_mixer_table.setCellWidget(index, 3, mute)
+            action = QPushButton("Parar" if active else "Tocar")
+            action.clicked.connect(lambda _checked=False, media=int(row["media_id"]), audio_path=path, target=route_combo: self._toggle_mixer_loop(media, audio_path, str(target.currentData())))
+            self.loop_mixer_table.setCellWidget(index, 4, action)
+        self._populate_crossfade_sources()
+
+    def _output_name(self, device_id: str) -> str:
+        for device in AudioEngine.available_outputs():
+            if bytes(device.id()).decode(errors="ignore") == device_id:
+                return device.description()
+        return ""
+
+    @staticmethod
+    def _player_state_text(state) -> str:
+        from PySide6.QtMultimedia import QMediaPlayer
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            return "tocando"
+        if state == QMediaPlayer.PlaybackState.PausedState:
+            return "pausado"
+        return "parado"
+
+    def _set_cart_mixer_route(self, slot: int, route: str):
+        try:
+            self.engine.set_cartouche_route(slot, route)
+            self.db.execute("UPDATE cartouche_slots SET route=? WHERE slot=?", (route, slot))
+            self.statusBar().showMessage(f"Cartucho {slot} direcionado para {route}", 4000)
+        except (RuntimeError, ValueError) as exc:
+            self.statusBar().showMessage(str(exc), 7000)
+        QTimer.singleShot(0, self._refresh_audio_console)
+
+    def _set_loop_mixer_route(self, media_id: int, route: str):
+        self.db.execute("UPDATE loop_tracks SET route=? WHERE media_id=?", (route, media_id))
+        self.statusBar().showMessage(f"Destino da trilha salvo: {route}", 4000)
+
+    def _toggle_mixer_loop(self, media_id: int, path: str, route: str):
+        if self.engine.loop_active(path):
+            self.engine.stop_loop(path)
+            self.db.execute("UPDATE loop_tracks SET enabled=0 WHERE media_id=?", (media_id,))
+        else:
+            try:
+                self.engine.start_loop(path, route)
+                self.db.execute("UPDATE loop_tracks SET enabled=1,route=? WHERE media_id=?", (route, media_id))
+            except (RuntimeError, ValueError) as exc:
+                self.statusBar().showMessage(str(exc), 7000)
+        self._refresh_audio_console()
+
+    def _populate_crossfade_sources(self, *_args):
+        if not hasattr(self, "crossfade_source_a"):
+            return
+        bus = self.crossfade_bus.currentText()
+        sources = self.engine.active_sources(bus)
+        for combo in (self.crossfade_source_a, self.crossfade_source_b):
+            current = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            for source_id in sources:
+                combo.addItem(self._audio_source_label(source_id), source_id)
+            selected = combo.findData(current)
+            if selected >= 0:
+                combo.setCurrentIndex(selected)
+            combo.blockSignals(False)
+        if len(sources) > 1 and self.crossfade_source_a.currentData() == self.crossfade_source_b.currentData():
+            self.crossfade_source_b.setCurrentIndex(1)
+        self.crossfade_button.setEnabled(len(sources) >= 2)
+
+    def _audio_source_label(self, source_id: str) -> str:
+        if source_id == "program":
+            return "Player principal"
+        if source_id == "preview":
+            return "Pré-escuta"
+        if source_id.startswith("cart:"):
+            return f"Cartucho {source_id.split(':', 1)[1]}"
+        if source_id.startswith("loop:"):
+            path_key = source_id.split(":", 1)[1]
+            row = next((item for item in self.db.all("SELECT path,title FROM media") if self.engine._loop_key(str(item["path"])) == path_key), None)
+            return f"Trilha · {row['title']}" if row else "Trilha em loop"
+        return source_id
+
+    def _apply_crossfade(self):
+        source_a, source_b = self.crossfade_source_a.currentData(), self.crossfade_source_b.currentData()
+        if not source_a or not source_b or source_a == source_b:
+            self.statusBar().showMessage("Escolha duas fontes ativas diferentes no mesmo barramento", 6000)
+            return
+        try:
+            self.engine.crossfade(str(source_a), str(source_b), self.crossfade_duration.value())
+            self.statusBar().showMessage(f"Crossfade aplicado em {self.crossfade_bus.currentText()}", 4000)
+        except ValueError as exc:
+            self.statusBar().showMessage(str(exc), 7000)
+
+    def _audio_meter_updated(self, bus: str, peak: float, rms: float):
+        widgets = self.bus_widgets.get(bus)
+        if not widgets:
+            return
+        db_peak = 20 * math.log10(max(peak, 0.001))
+        db_rms = 20 * math.log10(max(rms, 0.001))
+        widgets["meter"].setValue(max(0, min(600, round((db_peak + 60) * 10))))
+        widgets["level"].setText(f"Pico {db_peak:.1f} dBFS · RMS {db_rms:.1f} dBFS")
 
     def _build_menus(self):
         file_menu = self.menuBar().addMenu("Arquivo")
@@ -563,11 +872,14 @@ class MainWindow(QMainWindow):
         audio_settings.triggered.connect(self._open_settings)
 
         view_menu = self.menuBar().addMenu("Exibir")
-        for dock in (self.library_dock, self.program_dock, self.timeline_dock, self.history_dock, self.cart_dock):
+        for dock in (self.library_dock, self.program_dock, self.timeline_dock, self.history_dock, self.cart_dock, self.console_dock):
             view_menu.addAction(dock.toggleViewAction())
 
     def _wire_audio(self):
         self.engine.program_state.connect(self._playback_state)
+        self.engine.preview_state.connect(self._preview_playback_state)
+        self.engine.loop_state.connect(lambda _state: self._refresh_audio_console())
+        self.engine.bus_meter.connect(self._audio_meter_updated)
         self.engine.program_position.connect(self._position_changed)
         self.engine.program_finished.connect(self._playback_finished)
         self.engine.program_faded_out.connect(self._fixed_transition_faded_out)
@@ -670,6 +982,7 @@ class MainWindow(QMainWindow):
             widgets["stop"].setEnabled(is_active)
             widgets["assign"].setEnabled(not is_active)
             widgets["remove"].setEnabled(bool(row and row["media_id"] is not None) and not is_active)
+        self._refresh_audio_console()
 
     def _assign_cartouche(self, slot: int):
         if self.engine.cartouche_active(slot):
@@ -804,6 +1117,7 @@ class MainWindow(QMainWindow):
             if history_id:
                 self.db.execute("UPDATE cartouche_history SET status='paused' WHERE id=?", (history_id,))
         self._refresh_cartouches()
+        self._refresh_audio_console()
 
     def _cartouche_finished(self, slot: int):
         history_id = self._cart_history_ids.pop(slot, None)
@@ -814,6 +1128,7 @@ class MainWindow(QMainWindow):
             )
         self._cart_states[slot] = "Pronto"
         self._refresh_cartouches()
+        self._refresh_audio_console()
         self._refresh_history()
 
     def _cartouche_error(self, slot: int, message: str):
@@ -828,6 +1143,7 @@ class MainWindow(QMainWindow):
             return
         self._cart_states[slot] = "Erro"
         self._refresh_cartouches()
+        self._refresh_audio_console()
         self.statusBar().showMessage(f"Falha no cartucho {slot}: {message}", 8000)
         self._refresh_history()
 
@@ -881,6 +1197,7 @@ class MainWindow(QMainWindow):
         if AppSettingsDialog(self.db, self.engine, self).exec():
             self.station_label.setText(self.db.setting("station_name", "HitMo Radio"))
             self.auto_badge.setText("AUTO · ON" if self.db.setting("auto_advance", "1") == "1" else "AUTO · OFF")
+            self._refresh_audio_console()
 
     def _configure_api_service(self):
         host, accepted = QInputDialog.getText(self, "Serviço central", "Endereço local (LAN com TLS deve ser iniciada pela linha de comando):", text=self._api_host)
@@ -1020,6 +1337,7 @@ class MainWindow(QMainWindow):
                     self.statusBar().showMessage(f"Trilha {row['title']}: {exc}", 8000)
             else:
                 self.statusBar().showMessage(f"Trilha salva indisponível: {row['title']}", 8000)
+        self._refresh_audio_console()
 
     def _refresh_playlist(self):
         self.queue.blockSignals(True)
@@ -1178,10 +1496,12 @@ class MainWindow(QMainWindow):
             if self.engine.loop_active(row["path"]):
                 self.engine.stop_loop(row["path"])
                 self.db.execute("UPDATE loop_tracks SET enabled=0 WHERE media_id=?", (media_id,))
+                self._refresh_audio_console()
                 self.statusBar().showMessage(f"Trilha interrompida: {row['title']}", 5000)
             else:
                 self.engine.start_loop(row["path"])
                 self.db.execute("INSERT INTO loop_tracks(media_id,enabled,route) VALUES(?,1,'PGM') ON CONFLICT(media_id) DO UPDATE SET enabled=1", (media_id,))
+                self._refresh_audio_console()
                 self.statusBar().showMessage(f"Trilha em loop: {row['title']}", 5000)
         elif action == show_file:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(row["path"]).parent)))
@@ -1365,14 +1685,20 @@ class MainWindow(QMainWindow):
         self._muted = muted
         self.engine.set_muted(muted)
         self.mute_button.setText("Ativar som" if muted else "Silenciar")
+        if hasattr(self, "program_channel_mute") and self.program_channel_mute.isChecked() != muted:
+            self.program_channel_mute.blockSignals(True)
+            self.program_channel_mute.setChecked(muted)
+            self.program_channel_mute.blockSignals(False)
 
     def _stop_loops(self):
         self.engine.stop_loop()
         self.db.execute("UPDATE loop_tracks SET enabled=0")
+        self._refresh_audio_console()
         self.statusBar().showMessage("Todas as trilhas em loop foram interrompidas", 5000)
 
     def _playback_state(self, state):
         from PySide6.QtMultimedia import QMediaPlayer
+        self.program_audio_state.setText(f"PGM · {self._player_state_text(state)}")
         if state == QMediaPlayer.PlaybackState.PlayingState:
             self._start_history()
             if self._current_queue_id:
@@ -1387,6 +1713,11 @@ class MainWindow(QMainWindow):
             if self._current_occurrence_item_id:
                 self.programming.set_occurrence_item_status(self._current_occurrence_item_id, "paused")
             self.statusBar().showMessage("Programa pausado")
+        self._populate_crossfade_sources()
+
+    def _preview_playback_state(self, state):
+        self.cue_audio_state.setText(f"CUE · {self._player_state_text(state)}")
+        self._populate_crossfade_sources()
 
     def _start_history(self):
         if not self._current:

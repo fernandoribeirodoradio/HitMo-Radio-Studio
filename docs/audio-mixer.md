@@ -23,7 +23,7 @@ Não é necessário instalar PortAudio, PyAudio, FFmpeg no sistema ou DLLs do Pl
 
 ## Limitações desta fase
 
-- A seleção de rotas, ganho, mute e crossfade está disponível na API do motor; a interface de console e controles visuais por fonte pertencem à Fase 3B.3.
+- Ganhos por fonte e barramento valem durante a sessão; associações de destino de cartuchos e trilhas são persistidas.
 - CUE não tem saída audível enquanto um segundo endpoint não for selecionado em Preferências.
 - A validação automatizada com WAV confirma decodificação, mixagem e buffers entregues ao sink. Não constitui teste auditivo nem validação de transmissão física.
 - O limitador trabalha por bloco e é uma proteção de pico digital simples, não um processador de áudio de estúdio.
