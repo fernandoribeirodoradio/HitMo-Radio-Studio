@@ -13,7 +13,7 @@ from PySide6.QtCore import QDate, QProcess, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QDateEdit, QDockWidget, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog,
+    QDateEdit, QDockWidget, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QMessageBox, QProgressBar, QPushButton, QStyle, QTableWidget, QTableWidgetItem,
     QTimeEdit, QVBoxLayout, QWidget,
@@ -155,6 +155,12 @@ class MainWindow(QMainWindow):
         self._fixed_transition_late = False
         self._scheduler_first_tick = True
         self.db.execute("UPDATE playback_history SET status='interrupted',ended_at=CURRENT_TIMESTAMP WHERE status IN ('loading','playing','paused')")
+        self.db.execute(
+            "UPDATE cartouche_history SET status='interrupted',ended_at=CURRENT_TIMESTAMP,"
+            "error_message='Aplicativo reiniciado durante a execução' WHERE status IN ('triggered','loading','playing','paused')"
+        )
+        self._cart_history_ids: dict[int, int] = {}
+        self._cart_states = {slot: "Pronto" for slot in range(1, 13)}
         self.playlist.recover_interrupted()
         self.programming.recover_interrupted()
         self.setWindowTitle("HitMo Radio Studio")
@@ -170,6 +176,7 @@ class MainWindow(QMainWindow):
         self._refresh_timeline()
         self._refresh_program_blocks()
         self._refresh_history()
+        self._refresh_cartouches()
         self._load_library_folders()
         self._restore_loop_tracks()
         self._refresh_library()
@@ -420,7 +427,7 @@ class MainWindow(QMainWindow):
         self.history_next.clicked.connect(lambda: self._history_page(1))
         self.history_table = QTableWidget(0, 17)
         self.history_table.setHorizontalHeaderLabels([
-            "Evento no software", "Registro", "Início PGM", "Fim PGM", "Material", "ID material", "Categoria",
+            "Evento no software", "Registro", "Início observado", "Fim observado", "Material", "ID material", "Categoria",
             "Operador", "Situação do item", "Seleção", "Situação da ocorrência", "Programado para", "Selecionado em", "Bloco", "Ocorrência", "Segundos", "Motivo/erro",
         ])
         self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -444,9 +451,68 @@ class MainWindow(QMainWindow):
         self.history_dock.setObjectName("historyDock")
         self.history_dock.setWidget(history_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.history_dock)
+        cart_panel = QWidget()
+        cart_layout = QVBoxLayout(cart_panel)
+        cart_layout.setContentsMargins(8, 8, 8, 8)
+        cart_layout.addWidget(QLabel("Cartuchos locais · saída de áudio compartilhada; não confirma transmissão."))
+        self.cart_grid = QGridLayout()
+        self.cart_grid.setSpacing(8)
+        self.cart_slots = {}
+        self.cart_shortcuts = []
+        for slot in range(1, 13):
+            card = QWidget()
+            card.setObjectName("cartoucheCard")
+            card.setStyleSheet("QWidget#cartoucheCard { background:#191d24; border:1px solid #303642; border-radius:6px; }")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(8, 7, 8, 7)
+            title = QLabel(f"Cartucho {slot}")
+            title.setObjectName("cartoucheTitle")
+            title.setWordWrap(True)
+            category = QLabel("Vazio · F" + str(slot))
+            category.setObjectName("mutedText")
+            category.setWordWrap(True)
+            state = QLabel("Vazio")
+            play = QPushButton(f"PLAY · F{slot}")
+            pause = QPushButton("PAUSE")
+            stop = QPushButton("STOP")
+            assign = QPushButton("Associar material…")
+            remove = QPushButton("Remover associação")
+            play.clicked.connect(lambda _checked=False, number=slot: self._fire_cartouche(number))
+            pause.clicked.connect(lambda _checked=False, number=slot: self._pause_cartouche(number))
+            stop.clicked.connect(lambda _checked=False, number=slot: self._stop_cartouche(number))
+            assign.clicked.connect(lambda _checked=False, number=slot: self._assign_cartouche(number))
+            remove.clicked.connect(lambda _checked=False, number=slot: self._remove_cartouche(number))
+            card_layout.addWidget(title)
+            card_layout.addWidget(category)
+            card_layout.addWidget(state)
+            controls = QHBoxLayout()
+            controls.addWidget(play)
+            controls.addWidget(pause)
+            controls.addWidget(stop)
+            card_layout.addLayout(controls)
+            card_layout.addWidget(assign)
+            card_layout.addWidget(remove)
+            self.cart_grid.addWidget(card, (slot - 1) // 4, (slot - 1) % 4)
+            self.cart_slots[slot] = {"title": title, "category": category, "state": state,
+                                     "play": play, "pause": pause, "stop": stop,
+                                     "assign": assign, "remove": remove}
+            shortcut = QShortcut(QKeySequence(f"F{slot}"), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(lambda number=slot: self._fire_cartouche(number))
+            self.cart_shortcuts.append(shortcut)
+        cart_layout.addLayout(self.cart_grid)
+        stop_all_carts = QPushButton("PARAR TODOS OS CARTUCHOS")
+        stop_all_carts.clicked.connect(self._stop_all_cartouches)
+        cart_layout.addWidget(stop_all_carts)
+        cart_layout.addStretch(1)
+        self.cart_dock = QDockWidget("Cartucheira · 12 posições", self)
+        self.cart_dock.setObjectName("cartoucheDock")
+        self.cart_dock.setWidget(cart_panel)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.cart_dock)
         self.tabifyDockWidget(self.timeline_dock, self.history_dock)
+        self.tabifyDockWidget(self.history_dock, self.cart_dock)
         self.tabifyDockWidget(self.program_dock, self.timeline_dock)
-        self.program_dock.raise_()
+        self.cart_dock.raise_()
 
         self._build_menus()
         self.history_period_enabled.toggled.connect(self._toggle_history_period)
@@ -490,7 +556,7 @@ class MainWindow(QMainWindow):
         audio_settings.triggered.connect(self._open_settings)
 
         view_menu = self.menuBar().addMenu("Exibir")
-        for dock in (self.library_dock, self.program_dock, self.timeline_dock, self.history_dock):
+        for dock in (self.library_dock, self.program_dock, self.timeline_dock, self.history_dock, self.cart_dock):
             view_menu.addAction(dock.toggleViewAction())
 
     def _wire_audio(self):
@@ -501,6 +567,9 @@ class MainWindow(QMainWindow):
         self.engine.program_error.connect(self._audio_error)
         self.engine.loop_error.connect(lambda message: self.statusBar().showMessage(f"Erro na trilha: {message}", 8000))
         self.engine.preview_error.connect(lambda message: self.statusBar().showMessage(f"Erro na pré-escuta: {message}", 8000))
+        self.engine.cart_state.connect(self._cartouche_player_state)
+        self.engine.cart_finished.connect(self._cartouche_finished)
+        self.engine.cart_error.connect(self._cartouche_error)
 
     def _apply_theme(self):
         # The offscreen Qt plugin may not enumerate Windows' installed fonts.
@@ -561,6 +630,189 @@ class MainWindow(QMainWindow):
     def _operator_changed(self, name: str):
         if hasattr(self, "operator_label"):
             self.operator_label.setText(f"Operador identificado: {name or 'não selecionado'}")
+
+    def _refresh_cartouches(self):
+        rows = self.db.all(
+            "SELECT s.slot,s.media_id,m.title,m.category,m.path,m.active,COALESCE(c.material_kind,'audio') AS material_kind "
+            "FROM cartouche_slots s LEFT JOIN media m ON m.id=s.media_id "
+            "LEFT JOIN material_categories c ON c.name=m.category ORDER BY s.slot"
+        )
+        by_slot = {int(row["slot"]): row for row in rows}
+        for slot, widgets in self.cart_slots.items():
+            row = by_slot.get(slot)
+            is_active = self.engine.cartouche_active(slot)
+            has_material = bool(row and row["media_id"] is not None and row["title"])
+            if not has_material:
+                label, state = f"Cartucho {slot}", "Vazio"
+            else:
+                label = str(row["title"])
+                state = self._cart_states.get(slot, "Pronto")
+            widgets["title"].setText(label)
+            widgets["category"].setText((str(row["category"]) if has_material else "Vazio") + f" · F{slot}")
+            widgets["state"].setText(state)
+            widgets["play"].setText("RETOMAR" if is_active and state == "Pausado" else f"PLAY · F{slot}")
+            widgets["play"].setEnabled(has_material and (not is_active or state == "Pausado"))
+            widgets["pause"].setEnabled(is_active and state == "Tocando")
+            widgets["stop"].setEnabled(is_active)
+            widgets["assign"].setEnabled(not is_active)
+            widgets["remove"].setEnabled(bool(row and row["media_id"] is not None) and not is_active)
+
+    def _assign_cartouche(self, slot: int):
+        if self.engine.cartouche_active(slot):
+            self.statusBar().showMessage("Pare o cartucho antes de trocar sua associação", 5000)
+            return
+        materials = self.db.all(
+            "SELECT m.id,m.title,m.artist,m.category FROM media m "
+            "LEFT JOIN material_categories c ON c.name=m.category "
+            "WHERE m.active=1 AND COALESCE(c.material_kind,'audio')='audio' ORDER BY m.title COLLATE NOCASE"
+        )
+        if not materials:
+            self.statusBar().showMessage("Não há materiais de áudio ativos para associar", 6000)
+            return
+        labels = [f"[{int(row['id'])}] {row['title']} · {row['category']}" for row in materials]
+        label, accepted = QInputDialog.getItem(self, f"Associar cartucho {slot}", "Material cadastrado:", labels, 0, False)
+        if not accepted:
+            return
+        media_id = int(label.split("]", 1)[0][1:])
+        self.db.execute(
+            "INSERT INTO cartouche_slots(slot,media_id) VALUES(?,?) "
+            "ON CONFLICT(slot) DO UPDATE SET media_id=excluded.media_id", (slot, media_id)
+        )
+        self._cart_states[slot] = "Pronto"
+        self._refresh_cartouches()
+
+    def _remove_cartouche(self, slot: int):
+        if self.engine.cartouche_active(slot):
+            self.statusBar().showMessage("Pare o cartucho antes de remover sua associação", 5000)
+            return
+        self.db.execute("UPDATE cartouche_slots SET media_id=NULL WHERE slot=?", (slot,))
+        self._cart_states[slot] = "Vazio"
+        self._refresh_cartouches()
+
+    def _fire_cartouche(self, slot: int):
+        row = self.db.one(
+            "SELECT m.id,m.title,m.artist,m.path,m.category,m.active,COALESCE(c.material_kind,'audio') AS material_kind "
+            "FROM cartouche_slots s LEFT JOIN media m ON m.id=s.media_id "
+            "LEFT JOIN material_categories c ON c.name=m.category WHERE s.slot=?", (slot,)
+        )
+        if not row or row["id"] is None:
+            self.statusBar().showMessage(f"Cartucho {slot} vazio", 4000)
+            return False
+        if self.engine.cartouche_active(slot):
+            if self.engine.cartouche_paused(slot):
+                self.engine.resume_cartouche(slot)
+                return True
+            self.statusBar().showMessage(f"Cartucho {slot} já está ativo; disparo duplicado ignorado", 5000)
+            return False
+        snapshot = dict(row)
+        if not row["active"] or row["material_kind"] != "audio":
+            error = "Material inativo ou não classificado como áudio"
+            return self._record_cartouche_failure(slot, snapshot, error)
+        if not Path(row["path"]).is_file():
+            return self._record_cartouche_failure(slot, snapshot, "Arquivo de áudio não encontrado")
+        history_id = self.db.execute(
+            "INSERT INTO cartouche_history(slot,media_id_snapshot,title,path,category,operator,status) "
+            "VALUES(?,?,?,?,?,?, 'loading')",
+            (slot, int(row["id"]), row["title"], row["path"], row["category"], self.operator_combo.currentText()),
+        )
+        self._cart_history_ids[slot] = history_id
+        if not self.engine.play_cartouche(slot, str(row["path"])):
+            self._cart_history_ids.pop(slot, None)
+            self.db.execute(
+                "UPDATE cartouche_history SET ended_at=CURRENT_TIMESTAMP,status='failed',error_message='O player recusou o disparo' WHERE id=?",
+                (history_id,),
+            )
+            self._cart_states[slot] = "Erro"
+            self._refresh_cartouches()
+            self._refresh_history()
+            self.statusBar().showMessage(f"Cartucho {slot}: o player recusou o disparo", 6000)
+            return False
+        self._cart_states[slot] = "Pronto"
+        self._refresh_cartouches()
+        pgm_active = self._current is not None
+        note = "PGM mantido; a saída física segue compartilhada" if pgm_active else "saída física compartilhada"
+        self.statusBar().showMessage(f"Cartucho {slot} disparado · {row['title']} · {note}", 7000)
+        self._refresh_history()
+        return True
+
+    def _record_cartouche_failure(self, slot: int, row: dict, error: str):
+        self.db.execute(
+            "INSERT INTO cartouche_history(slot,media_id_snapshot,title,path,category,operator,ended_at,status,error_message) "
+            "VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP,'failed',?)",
+            (slot, row.get("id"), row.get("title", ""), row.get("path", ""), row.get("category", ""),
+             self.operator_combo.currentText(), error),
+        )
+        self._cart_states[slot] = "Erro"
+        self._refresh_cartouches()
+        self.statusBar().showMessage(f"Cartucho {slot}: {error}", 8000)
+        self._refresh_history()
+        return False
+
+    def _pause_cartouche(self, slot: int):
+        if self.engine.cartouche_active(slot):
+            self.engine.pause_cartouche(slot)
+
+    def _stop_cartouche(self, slot: int):
+        if not self.engine.cartouche_active(slot):
+            return
+        self.engine.stop_cartouche(slot)
+        history_id = self._cart_history_ids.pop(slot, None)
+        if history_id:
+            self.db.execute(
+                "UPDATE cartouche_history SET ended_at=CURRENT_TIMESTAMP,status='stopped' WHERE id=? AND status IN ('loading','playing','paused')",
+                (history_id,),
+            )
+        self._cart_states[slot] = "Pronto"
+        self._refresh_cartouches()
+        self._refresh_history()
+
+    def _stop_all_cartouches(self):
+        for slot in range(1, 13):
+            self._stop_cartouche(slot)
+        self.engine.stop_all_cartouches()
+        self.statusBar().showMessage("Todos os cartuchos ativos foram parados", 5000)
+
+    def _cartouche_player_state(self, slot: int, state):
+        from PySide6.QtMultimedia import QMediaPlayer
+        history_id = self._cart_history_ids.get(slot)
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self._cart_states[slot] = "Tocando"
+            if history_id:
+                self.db.execute(
+                    "UPDATE cartouche_history SET started_at=CASE WHEN started_at='' THEN CURRENT_TIMESTAMP ELSE started_at END,status='playing' WHERE id=?",
+                    (history_id,),
+                )
+        elif state == QMediaPlayer.PlaybackState.PausedState:
+            self._cart_states[slot] = "Pausado"
+            if history_id:
+                self.db.execute("UPDATE cartouche_history SET status='paused' WHERE id=?", (history_id,))
+        self._refresh_cartouches()
+
+    def _cartouche_finished(self, slot: int):
+        history_id = self._cart_history_ids.pop(slot, None)
+        if history_id:
+            self.db.execute(
+                "UPDATE cartouche_history SET ended_at=CURRENT_TIMESTAMP,status='completed' WHERE id=? AND status IN ('loading','playing','paused')",
+                (history_id,),
+            )
+        self._cart_states[slot] = "Pronto"
+        self._refresh_cartouches()
+        self._refresh_history()
+
+    def _cartouche_error(self, slot: int, message: str):
+        history_id = self._cart_history_ids.pop(slot, None)
+        if history_id:
+            self.db.execute(
+                "UPDATE cartouche_history SET ended_at=CURRENT_TIMESTAMP,status='failed',error_message=? WHERE id=?",
+                (message, history_id),
+            )
+        elif message == "Arquivo de áudio não encontrado.":
+            # Engine-originated missing files are already logged by the UI path when possible.
+            return
+        self._cart_states[slot] = "Erro"
+        self._refresh_cartouches()
+        self.statusBar().showMessage(f"Falha no cartucho {slot}: {message}", 8000)
+        self._refresh_history()
 
     def _manage_operators(self):
         OperatorDialog(self.db, self).exec()
@@ -1434,7 +1686,11 @@ class MainWindow(QMainWindow):
             if row["path"]:
                 title = f"{title} · {Path(row['path']).name}"
             values = (
-                row["event_time"], "Execução do player" if row["record_type"] == "player_event" else "Item de ocorrência",
+                row["event_time"], (
+                    "Evento do player PGM" if row["record_type"] == "player_event" else
+                    "Evento local de cartucho · sem confirmação de transmissão" if row["record_type"] == "cartouche_event" else
+                    "Item de ocorrência"
+                ),
                 row["started_at"], row["ended_at"], title, row["material_id"], row["category"], row["operator"],
                 row["status"], row["selection_state"], row["occurrence_status"], row["planned_for"], row["selected_at"], row["block_name_snapshot"], row["occurrence_id"],
                 f"{float(row['played_seconds'] or 0):.3f}", row["error_message"],
@@ -1516,7 +1772,7 @@ class MainWindow(QMainWindow):
         with open(path, "w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.writer(handle, delimiter=";")
             writer.writerow([
-                "Evento no software", "Tipo de registro", "Início PGM", "Fim PGM", "Título", "Artista", "ID do material", "Arquivo", "Categoria",
+                "Evento no software", "Tipo de registro", "Início observado", "Fim observado", "Título", "Artista", "ID do material", "Arquivo", "Categoria",
                 "Operador", "Segundos do player", "Situação do item", "Seleção", "Situação da ocorrência", "Programado para", "Selecionado em", "Origem", "Referência da origem",
                 "ID da ocorrência", "ID do bloco", "Snapshot do bloco", "Erro/motivo",
             ])
@@ -1539,9 +1795,14 @@ class MainWindow(QMainWindow):
             if queue_id:
                 self.playlist.set_status(queue_id, "planned")
             self._clear_current()
-        self.engine.stop_program()
-        self.engine.stop_preview()
-        self.engine.stop_loop()
+        for slot, history_id in tuple(self._cart_history_ids.items()):
+            self.db.execute(
+                "UPDATE cartouche_history SET ended_at=CURRENT_TIMESTAMP,status='interrupted',"
+                "error_message='Aplicativo encerrado durante a execução' WHERE id=? AND status IN ('loading','playing','paused')",
+                (history_id,),
+            )
+        self._cart_history_ids.clear()
+        self.engine.shutdown()
         if self._api_process.state() != QProcess.ProcessState.NotRunning:
             self._api_process.terminate()
             if not self._api_process.waitForFinished(2000):

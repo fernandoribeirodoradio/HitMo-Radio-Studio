@@ -1096,12 +1096,14 @@ class PlaybackHistoryService:
     def filter_options(self) -> dict[str, list[str]]:
         categories = [str(row["category"]) for row in self.db.all(
             "SELECT category FROM playback_history WHERE category<>'' UNION "
-            "SELECT category FROM program_occurrence_items WHERE category<>'' ORDER BY category COLLATE NOCASE"
+            "SELECT category FROM program_occurrence_items WHERE category<>'' UNION "
+            "SELECT category FROM cartouche_history WHERE category<>'' ORDER BY category COLLATE NOCASE"
         )]
         statuses = [str(row["status"]) for row in self.db.all(
             "SELECT status FROM playback_history WHERE status<>'' UNION "
             "SELECT status FROM program_occurrence_items WHERE status<>'' UNION "
-            "SELECT status FROM program_occurrences WHERE status<>'' ORDER BY status COLLATE NOCASE"
+            "SELECT status FROM program_occurrences WHERE status<>'' UNION "
+            "SELECT status FROM cartouche_history WHERE status<>'' ORDER BY status COLLATE NOCASE"
         )]
         return {"categories": categories, "statuses": sorted(set(statuses) | {"selected"}, key=str.casefold)}
 
@@ -1166,7 +1168,13 @@ class PlaybackHistoryService:
             "o.id AS occurrence_id,o.block_id,o.block_name_snapshot,o.status AS occurrence_status "
             "FROM program_occurrence_items i JOIN program_occurrences o ON o.id=i.occurrence_id "
             "WHERE NOT EXISTS (SELECT 1 FROM playback_history h WHERE h.source_ref=i.id "
-            "AND (h.occurrence_id=o.id OR (h.occurrence_id IS NULL AND h.source_type IN ('scheduled_block','scheduled_event','timeline'))))"
+            "AND (h.occurrence_id=o.id OR (h.occurrence_id IS NULL AND h.source_type IN ('scheduled_block','scheduled_event','timeline')))) "
+            "UNION ALL "
+            "SELECT 'cartouche_event' AS record_type,c.id AS id,c.triggered_at AS event_time,"
+            "c.media_id_snapshot AS material_id,c.title,'' AS artist,c.path,c.category,c.operator,"
+            "c.started_at,c.ended_at,0.0 AS played_seconds,c.status,'' AS selection_state,'' AS planned_for,'' AS selected_at,"
+            "'cartouche' AS source_type,c.slot AS source_ref,c.error_message,NULL AS occurrence_id,NULL AS block_id,"
+            "'' AS block_name_snapshot,'' AS occurrence_status FROM cartouche_history c"
             ")"
         )
         total = int(self.db.one(audit + " SELECT COUNT(*) AS n FROM audit" + filter_sql, tuple(params))["n"])

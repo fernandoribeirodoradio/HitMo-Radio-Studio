@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
@@ -21,6 +22,9 @@ class AudioEngine(QObject):
     program_finished = Signal()
     program_faded_out = Signal(int)
     preview_finished = Signal()
+    cart_state = Signal(int, object)
+    cart_finished = Signal(int)
+    cart_error = Signal(int, str)
 
     def __init__(self, output_id: str = ""):
         super().__init__()
@@ -29,6 +33,8 @@ class AudioEngine(QObject):
         self.program = QMediaPlayer(self)
         self.preview = QMediaPlayer(self)
         self._loop_players: dict[str, tuple[QMediaPlayer, QAudioOutput]] = {}
+        self._cart_players: dict[int, tuple[QMediaPlayer, QAudioOutput]] = {}
+        self._cart_active: set[int] = set()
         self._program_fade_started = 0.0
         self._program_fade_duration_ms = 0
         self._program_fade_start_volume = 1.0
@@ -44,7 +50,89 @@ class AudioEngine(QObject):
         self.preview.positionChanged.connect(lambda p: self.preview_position.emit(p, self.preview.duration()))
         self.program.mediaStatusChanged.connect(self._program_media_status)
         self.preview.mediaStatusChanged.connect(self._preview_media_status)
+        for slot in range(1, 13):
+            output = QAudioOutput(self)
+            player = QMediaPlayer(self)
+            player.setAudioOutput(output)
+            player.playbackStateChanged.connect(lambda state, number=slot: self.cart_state.emit(number, state))
+            player.errorOccurred.connect(lambda _error, message, number=slot: self._cart_error(number, message))
+            player.mediaStatusChanged.connect(lambda status, number=slot: self._cart_media_status(number, status))
+            self._cart_players[slot] = (player, output)
         self.set_output(output_id)
+
+    def _cart_error(self, slot: int, message: str) -> None:
+        self._cart_active.discard(slot)
+        player, _output = self._cart_players[slot]
+        details = message or player.errorString() or "Falha ao abrir o áudio."
+        player.stop()
+        player.setSource(QUrl())
+        self.cart_error.emit(slot, details)
+
+    def _cart_media_status(self, slot: int, status) -> None:
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self._cart_active.discard(slot)
+            player, _output = self._cart_players[slot]
+            player.setSource(QUrl())
+            self.cart_finished.emit(slot)
+
+    def play_cartouche(self, slot: int, path: str) -> bool:
+        slot = int(slot)
+        if slot not in self._cart_players:
+            raise ValueError("O número do cartucho deve estar entre 1 e 12.")
+        if slot in self._cart_active:
+            return False
+        player, _output = self._cart_players[slot]
+        if player.playbackState() != QMediaPlayer.PlaybackState.StoppedState or player.source().isValid():
+            return False
+        if not Path(path).is_file():
+            self.cart_error.emit(slot, "Arquivo de áudio não encontrado.")
+            return False
+        self._cart_active.add(slot)
+        self._load(player, path)
+        return True
+
+    def pause_cartouche(self, slot: int) -> None:
+        pair = self._cart_players.get(int(slot))
+        if pair and int(slot) in self._cart_active:
+            pair[0].pause()
+
+    def resume_cartouche(self, slot: int) -> None:
+        pair = self._cart_players.get(int(slot))
+        if pair and int(slot) in self._cart_active and pair[0].playbackState() == QMediaPlayer.PlaybackState.PausedState:
+            pair[0].play()
+
+    def stop_cartouche(self, slot: int) -> None:
+        slot = int(slot)
+        pair = self._cart_players.get(slot)
+        if not pair:
+            return
+        player, _output = pair
+        was_active = slot in self._cart_active
+        self._cart_active.discard(slot)
+        if was_active or player.source().isValid():
+            player.stop()
+            player.setSource(QUrl())
+
+    def stop_all_cartouches(self) -> None:
+        for slot in tuple(self._cart_players):
+            self.stop_cartouche(slot)
+
+    def shutdown(self) -> None:
+        """Stop playback and release every source before the engine is destroyed."""
+        self.stop_program()
+        self.program.setSource(QUrl())
+        self.stop_preview()
+        self.stop_loop()
+        self.stop_all_cartouches()
+        for player, _output in self._cart_players.values():
+            player.setSource(QUrl())
+
+    def cartouche_active(self, slot: int) -> bool:
+        return int(slot) in self._cart_active
+
+    def cartouche_paused(self, slot: int) -> bool:
+        pair = self._cart_players.get(int(slot))
+        return bool(pair and pair[0].playbackState() == QMediaPlayer.PlaybackState.PausedState)
 
     def _error(self, player: QMediaPlayer, message: str) -> None:
         if player is self.program:
@@ -193,7 +281,9 @@ class AudioEngine(QObject):
             chosen = devices[0]
         if chosen.isNull():
             return
-        outputs = [self.program_output, self.preview_output, *(output for _player, output in self._loop_players.values())]
+        outputs = [self.program_output, self.preview_output,
+                   *(output for _player, output in self._loop_players.values()),
+                   *(output for _player, output in self._cart_players.values())]
         for output in outputs:
             output.setDevice(chosen)
 

@@ -134,6 +134,68 @@ class AudioEngineSmokeTests(unittest.TestCase):
             engine.deleteLater()
             self.app.processEvents()
 
+    def test_cartouche_players_are_independent_and_support_pause_resume(self):
+        if not QMediaDevices.audioOutputs():
+            self.skipTest("Nenhuma saída de áudio disponível neste computador.")
+        with tempfile.TemporaryDirectory() as temp:
+            def write_audio(name):
+                path = Path(temp) / name
+                with wave.open(str(path), "wb") as stream:
+                    stream.setnchannels(1)
+                    stream.setsampwidth(2)
+                    stream.setframerate(8000)
+                    stream.writeframes(b"\x01\x00" * 32000)
+                return path
+
+            one, two = write_audio("cart-1.wav"), write_audio("cart-2.wav")
+            engine = AudioEngine()
+            self.assertEqual(set(engine._cart_players), set(range(1, 13)))
+            self.assertTrue(engine.play_cartouche(1, str(one)))
+            self.assertTrue(self._wait_until(lambda: engine._cart_players[1][0].playbackState() == QMediaPlayer.PlaybackState.PlayingState))
+            self.assertFalse(engine.play_cartouche(1, str(one)), "O segundo disparo do cartucho ativo deve ser ignorado.")
+            self.assertTrue(engine.play_cartouche(2, str(two)))
+            self.assertTrue(self._wait_until(lambda: engine._cart_players[2][0].playbackState() == QMediaPlayer.PlaybackState.PlayingState))
+            engine.pause_cartouche(1)
+            self.assertTrue(self._wait_until(lambda: engine.cartouche_paused(1)))
+            engine.resume_cartouche(1)
+            self.assertTrue(self._wait_until(lambda: engine._cart_players[1][0].playbackState() == QMediaPlayer.PlaybackState.PlayingState))
+            engine.stop_cartouche(1)
+            self.assertFalse(engine.cartouche_active(1))
+            self.assertEqual(engine._cart_players[2][0].playbackState(), QMediaPlayer.PlaybackState.PlayingState)
+            engine.stop_all_cartouches()
+            self.assertFalse(any(engine.cartouche_active(slot) for slot in range(1, 13)))
+            engine.deleteLater()
+            self.app.processEvents()
+
+    def test_cartouche_missing_file_reports_error_without_activating_player(self):
+        engine = AudioEngine()
+        errors = []
+        engine.cart_error.connect(lambda slot, message: errors.append((slot, message)))
+        self.assertFalse(engine.play_cartouche(12, str(Path(tempfile.gettempdir()) / "missing-hitmo-cart.wav")))
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0][0], 12)
+        self.assertFalse(engine.cartouche_active(12))
+        with self.assertRaises(ValueError):
+            engine.play_cartouche(13, "invalid.wav")
+        engine.deleteLater()
+        self.app.processEvents()
+
+    def test_cartouche_decode_failure_is_reported_by_qt_player(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "invalid.wav"
+            path.write_bytes(b"not an audio stream")
+            engine = AudioEngine()
+            errors = []
+            engine.cart_error.connect(lambda slot, message: errors.append((slot, message)))
+            self.assertTrue(engine.play_cartouche(4, str(path)))
+            self.assertTrue(self._wait_until(lambda: bool(errors), timeout_ms=4000))
+            self.assertEqual(errors[0][0], 4)
+            self.assertTrue(errors[0][1])
+            self.assertFalse(engine.cartouche_active(4))
+            engine.shutdown()
+            engine.deleteLater()
+            self.app.processEvents()
+
     @staticmethod
     def _wait_until(predicate, timeout_ms=3000):
         if predicate():

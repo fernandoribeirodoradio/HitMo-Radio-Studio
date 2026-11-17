@@ -155,6 +155,25 @@ class Database:
                     enabled INTEGER NOT NULL DEFAULT 1,
                     FOREIGN KEY(media_id) REFERENCES media(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS cartouche_slots (
+                    slot INTEGER PRIMARY KEY CHECK(slot BETWEEN 1 AND 12),
+                    media_id INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS cartouche_history (
+                    id INTEGER PRIMARY KEY,
+                    slot INTEGER NOT NULL CHECK(slot BETWEEN 1 AND 12),
+                    media_id_snapshot INTEGER,
+                    title TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT '',
+                    operator TEXT NOT NULL DEFAULT '',
+                    triggered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    started_at TEXT NOT NULL DEFAULT '',
+                    ended_at TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'triggered',
+                    error_message TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_cartouche_history_triggered ON cartouche_history(triggered_at DESC);
                 CREATE TABLE IF NOT EXISTS playback_history (
                     id INTEGER PRIMARY KEY, media_id INTEGER,
                     title TEXT NOT NULL, artist TEXT NOT NULL DEFAULT '',

@@ -490,6 +490,22 @@ class CentralAPIProcessTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "400"):
             self.admin.history(start_date="15/11/2026")
 
+    def test_cartouche_history_is_available_through_operational_history_api(self):
+        material_id = self.db.execute(
+            "INSERT INTO media(path,title,category) VALUES(?,?,?)", ("C:/radio/jingle.wav", "Jingle cartucho", "Vinheta")
+        )
+        event_id = self.db.execute(
+            "INSERT INTO cartouche_history(slot,media_id_snapshot,title,path,category,operator,status) "
+            "VALUES(3,?,?,?,?,?,'triggered')",
+            (material_id, "Jingle cartucho", "C:/radio/jingle.wav", "Vinheta", "Operador Teste"),
+        )
+        response = self.admin.history(material="Jingle cartucho")
+        event = next(row for row in response["history"] if row["record_type"] == "cartouche_event")
+        self.assertEqual(event["id"], event_id)
+        self.assertEqual(event["source_type"], "cartouche")
+        self.assertEqual(event["status"], "triggered")
+        self.assertEqual(event["operator"], "Operador Teste")
+
 
 if __name__ == "__main__":
     unittest.main()
