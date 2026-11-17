@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import math
 from pathlib import Path
 from threading import RLock
 
@@ -33,10 +34,10 @@ class _ChannelControl(QObject):
             return self.engine.channel_gain(self.channel_id)
         return self.engine.bus_gain(self.bus)
 
-    def setVolume(self, value: float) -> None:
+    def setVolume(self, value: float, *, persist: bool = True) -> None:
         value = min(1.0, max(0.0, float(value)))
         if self.channel_id:
-            self.engine.set_channel_gain(self.channel_id, value)
+            self.engine.set_channel_gain(self.channel_id, value, persist=persist)
         else:
             self.engine.set_bus_gain(self.bus, value)
         self.volumeChanged.emit(value)
@@ -161,8 +162,9 @@ class AudioEngine(QObject):
     bus_error = Signal(str, str)
     bus_status = Signal(str, bool, str)
     routing_changed = Signal(str, str)
+    settings_changed = Signal(object)
 
-    def __init__(self, output_id: str = "", cue_output_id: str = "", *, device_provider=None, sink_factory=None):
+    def __init__(self, output_id: str = "", cue_output_id: str = "", *, device_provider=None, sink_factory=None, mixer_state=None):
         super().__init__()
         self._lock = RLock()
         self._channels: dict[str, dict] = {}
@@ -170,6 +172,9 @@ class AudioEngine(QObject):
         self._bus_gains = {"PGM": 1.0, "CUE": 1.0}
         self._bus_mutes = {"PGM": False, "CUE": False}
         self._master_gain = DEFAULT_MASTER_GAIN
+        self._crossfade_duration_ms = 3000
+        self._saved_channel_settings: dict[str, dict] = {}
+        self._restore_mixer_settings(mixer_state)
         self._crossfades: dict[str, dict] = {}
         self._device_provider = device_provider or QMediaDevices.audioOutputs
         self._sink_factory = sink_factory or (lambda device, fmt, parent: QAudioSink(device, fmt, parent))
@@ -224,7 +229,12 @@ class AudioEngine(QObject):
         player.setAudioBufferOutput(buffer_output)
         queue = PCMQueue()
         with self._lock:
-            self._channels[channel_id] = {"queue": queue, "gain": 1.0, "muted": False, "control": None, "player": player}
+            saved = self._saved_channel_settings.get(channel_id, {})
+            self._channels[channel_id] = {
+                "queue": queue, "gain": saved.get("gain", 1.0),
+                "saved_gain": saved.get("gain", 1.0), "muted": saved.get("muted", False),
+                "control": None, "player": player,
+            }
             self._routes[channel_id] = bus
             self._player_channels[id(player)] = channel_id
             self._end_generations.setdefault(channel_id, 0)
@@ -481,11 +491,17 @@ class AudioEngine(QObject):
             raise KeyError(path)
         self.set_channel_route(f"loop:{key}", bus)
 
-    def set_channel_gain(self, channel_id: str, gain: float) -> None:
+    def set_channel_gain(self, channel_id: str, gain: float, *, persist: bool = True) -> None:
         with self._lock:
-            self._channels[channel_id]["gain"] = min(1.0, max(0.0, float(gain)))
+            value = min(1.0, max(0.0, float(gain)))
+            self._channels[channel_id]["gain"] = value
             self._crossfades.pop(channel_id, None)
+            if persist:
+                self._channels[channel_id]["saved_gain"] = value
+                self._save_channel_setting(channel_id)
         self._channels[channel_id]["control"].volumeChanged.emit(float(gain))
+        if persist:
+            self._emit_settings_changed()
 
     def channel_gain(self, channel_id: str) -> float:
         return float(self._channels[channel_id]["gain"])
@@ -493,20 +509,25 @@ class AudioEngine(QObject):
     def set_channel_muted(self, channel_id: str, muted: bool) -> None:
         with self._lock:
             self._channels[channel_id]["muted"] = bool(muted)
+            self._save_channel_setting(channel_id)
+        self._emit_settings_changed()
 
     def channel_muted(self, channel_id: str) -> bool:
         return bool(self._channels[channel_id]["muted"])
 
     def set_bus_gain(self, bus: str, gain: float) -> None:
         with self._lock:
+            bus = bus.upper()
             self._bus_gains[bus] = min(1.0, max(0.0, float(gain)))
+        self._emit_settings_changed()
 
     def bus_gain(self, bus: str) -> float:
         return float(self._bus_gains[bus])
 
     def set_bus_muted(self, bus: str, muted: bool) -> None:
         with self._lock:
-            self._bus_mutes[bus] = bool(muted)
+            self._bus_mutes[bus.upper()] = bool(muted)
+        self._emit_settings_changed()
 
     def bus_muted(self, bus: str) -> bool:
         return bool(self._bus_mutes[bus])
@@ -514,6 +535,95 @@ class AudioEngine(QObject):
     def set_master_gain(self, gain: float) -> None:
         with self._lock:
             self._master_gain = min(1.0, max(0.0, float(gain)))
+        self._emit_settings_changed()
+
+    @property
+    def crossfade_duration_ms(self) -> int:
+        return self._crossfade_duration_ms
+
+    def set_crossfade_duration(self, duration_ms: int) -> None:
+        value = int(duration_ms)
+        if not 100 <= value <= 15000:
+            raise ValueError("A duração do crossfade deve ficar entre 100 e 15000 ms.")
+        if value != self._crossfade_duration_ms:
+            self._crossfade_duration_ms = value
+            self._emit_settings_changed()
+
+    def _save_channel_setting(self, channel_id: str) -> None:
+        channel = self._channels[channel_id]
+        self._saved_channel_settings[channel_id] = {
+            "gain": float(channel.get("saved_gain", channel["gain"])), "muted": bool(channel["muted"]),
+        }
+
+    def export_mixer_settings(self) -> dict:
+        with self._lock:
+            channels = {key: dict(value) for key, value in self._saved_channel_settings.items()}
+            return {
+                "version": 1,
+                "master_gain": self._master_gain,
+                "buses": {name: {"gain": self._bus_gains[name], "muted": self._bus_mutes[name]} for name in self._buses},
+                "channels": channels,
+                "crossfade_duration_ms": self._crossfade_duration_ms,
+            }
+
+    def _emit_settings_changed(self) -> None:
+        self.settings_changed.emit(self.export_mixer_settings())
+
+    @staticmethod
+    def _valid_gain(value, default: float) -> float:
+        if isinstance(value, bool):
+            return default
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        return number if math.isfinite(number) and 0.0 <= number <= 1.0 else default
+
+    def _restore_mixer_settings(self, state) -> None:
+        if not isinstance(state, dict):
+            return
+        if state.get("version", 1) != 1:
+            return
+        self._master_gain = self._valid_gain(state.get("master_gain"), self._master_gain)
+        try:
+            duration = int(state.get("crossfade_duration_ms", self._crossfade_duration_ms))
+            if 100 <= duration <= 15000:
+                self._crossfade_duration_ms = duration
+        except (TypeError, ValueError, OverflowError):
+            pass
+        buses = state.get("buses")
+        if isinstance(buses, dict):
+            for name in ("PGM", "CUE"):
+                item = buses.get(name)
+                if not isinstance(item, dict):
+                    continue
+                self._bus_gains[name] = self._valid_gain(item.get("gain"), self._bus_gains[name])
+                if type(item.get("muted")) is bool:
+                    self._bus_mutes[name] = item["muted"]
+        channels = state.get("channels")
+        if isinstance(channels, dict):
+            for key, item in channels.items():
+                if not isinstance(key, str) or not isinstance(item, dict):
+                    continue
+                valid_channel = key in {"program", "preview"}
+                if key.startswith("cart:"):
+                    try:
+                        valid_channel = 1 <= int(key[5:]) <= 12
+                    except ValueError:
+                        valid_channel = False
+                elif key.startswith("loop:"):
+                    valid_channel = 0 < len(key) <= 32768
+                if not valid_channel:
+                    continue
+                try:
+                    gain = float(item.get("gain", 1.0))
+                except (TypeError, ValueError):
+                    gain = 1.0
+                muted = item.get("muted", False)
+                self._saved_channel_settings[key] = {
+                    "gain": self._valid_gain(gain, 1.0),
+                    "muted": muted if type(muted) is bool else False,
+                }
 
     @property
     def master_gain(self) -> float:
@@ -764,7 +874,7 @@ class AudioEngine(QObject):
     def _advance_program_fade(self) -> None:
         elapsed_ms = (time.monotonic() - self._program_fade_started) * 1000
         ratio = min(1.0, elapsed_ms / self._program_fade_duration_ms)
-        self.program_output.setVolume(self._program_fade_start_volume * (1.0 - ratio))
+        self.program_output.setVolume(self._program_fade_start_volume * (1.0 - ratio), persist=False)
         if ratio < 1.0:
             return
         position = self.program.position()
@@ -773,13 +883,13 @@ class AudioEngine(QObject):
         self._end_generations["program"] += 1
         self._crossfades.pop("program", None)
         self._channels["program"]["queue"].clear()
-        self.program_output.setVolume(self._program_fade_start_volume)
+        self.program_output.setVolume(self._program_fade_start_volume, persist=False)
         self.program_faded_out.emit(position)
 
     def cancel_program_fade(self) -> None:
         if self._program_fade_timer.isActive():
             self._program_fade_timer.stop()
-            self.program_output.setVolume(self._program_fade_start_volume)
+            self.program_output.setVolume(self._program_fade_start_volume, persist=False)
 
     def set_muted(self, muted: bool) -> None:
         self.program_output.setMuted(muted)

@@ -137,7 +137,19 @@ class MainWindow(QMainWindow):
         self.timeline = TimelineService(self.db)
         self.programming = ProgrammingService(self.db)
         self.history = PlaybackHistoryService(self.db)
-        self.engine = AudioEngine(self.db.setting("audio_output_id"), self.db.setting("cue_output_id"))
+        self._audio_mixer_settings_error = ""
+        try:
+            mixer_state = json.loads(self.db.setting("audio_mixer_state", "{}"))
+            if not isinstance(mixer_state, dict):
+                mixer_state = {}
+                self._audio_mixer_settings_error = "As preferências de áudio salvas têm formato inválido; foram usados valores seguros."
+        except (TypeError, json.JSONDecodeError):
+            mixer_state = {}
+            self._audio_mixer_settings_error = "As preferências de áudio salvas não puderam ser lidas; foram usados valores seguros."
+        self.engine = AudioEngine(
+            self.db.setting("audio_output_id"), self.db.setting("cue_output_id"),
+            mixer_state=mixer_state,
+        )
         self._current = None
         self._history_id = None
         self._history_offset = 0
@@ -146,7 +158,7 @@ class MainWindow(QMainWindow):
         self._current_source_type = "manual"
         self._current_source_ref = None
         self._current_planned_for = ""
-        self._muted = False
+        self._muted = self.engine.channel_muted("program")
         self._fixed_transition_target = None
         self._fixed_transition_fade_ms = 1000
         self._fixed_fade_timer_target = None
@@ -631,8 +643,9 @@ class MainWindow(QMainWindow):
         self.crossfade_source_b = QComboBox()
         self.crossfade_duration = QSpinBox()
         self.crossfade_duration.setRange(100, 15000)
-        self.crossfade_duration.setValue(3000)
+        self.crossfade_duration.setValue(self.engine.crossfade_duration_ms)
         self.crossfade_duration.setSuffix(" ms")
+        self.crossfade_duration.valueChanged.connect(self.engine.set_crossfade_duration)
         self.crossfade_button = QPushButton("Aplicar")
         self.crossfade_button.clicked.connect(self._apply_crossfade)
         fade_row.addWidget(self.crossfade_bus)
@@ -686,6 +699,10 @@ class MainWindow(QMainWindow):
         self.program_channel_mute.blockSignals(True)
         self.program_channel_mute.setChecked(self.engine.channel_muted("program"))
         self.program_channel_mute.blockSignals(False)
+        self.mute_button.blockSignals(True)
+        self.mute_button.setChecked(self.engine.channel_muted("program"))
+        self.mute_button.setText("Ativar som" if self.engine.channel_muted("program") else "Silenciar")
+        self.mute_button.blockSignals(False)
         self.preview_channel_mute.blockSignals(True)
         self.preview_channel_mute.setChecked(self.engine.channel_muted("preview"))
         self.preview_channel_mute.blockSignals(False)
@@ -891,6 +908,9 @@ class MainWindow(QMainWindow):
         self.engine.cart_error.connect(self._cartouche_error)
         self.engine.bus_error.connect(lambda bus, message: self.statusBar().showMessage(f"Saída {bus}: {message}", 10000))
         self.engine.bus_status.connect(self._audio_bus_status)
+        self.engine.settings_changed.connect(self._persist_audio_mixer_settings)
+        if self._audio_mixer_settings_error:
+            QTimer.singleShot(0, lambda message=self._audio_mixer_settings_error: self.statusBar().showMessage(message, 12000))
         for bus in ("PGM", "CUE"):
             error = self.engine._buses[bus].error_message
             if error:
@@ -899,6 +919,9 @@ class MainWindow(QMainWindow):
     def _audio_bus_status(self, bus: str, available: bool, message: str):
         if not available:
             self.statusBar().showMessage(f"Saída {bus}: {message}", 10000)
+
+    def _persist_audio_mixer_settings(self, state: dict):
+        self.db.set_setting("audio_mixer_state", json.dumps(state, ensure_ascii=False, separators=(",", ":")))
 
     def _apply_theme(self):
         # The offscreen Qt plugin may not enumerate Windows' installed fonts.
