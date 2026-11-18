@@ -33,11 +33,14 @@ class AppSettingsDialog(QDialog):
             selected = self.output.count() - 1
         self.output.setCurrentIndex(max(0, selected))
         self.cue_output = QComboBox()
-        self.cue_output.addItem("CUE desativado", "")
-        for device in AudioEngine.available_outputs():
+        available_outputs = AudioEngine.available_outputs()
+        self.cue_output.addItem("Compartilhar a saída PGM" if len(available_outputs) == 1 else "CUE desativado", "")
+        for device in available_outputs:
             ident = bytes(device.id()).decode(errors="ignore")
             self.cue_output.addItem(device.description(), ident)
         cue_selected = self.cue_output.findData(stored_cue_id)
+        if not stored_cue_id and len(available_outputs) == 1:
+            cue_selected = self.cue_output.findData(bytes(available_outputs[0].id()).decode(errors="ignore"))
         if stored_cue_id and cue_selected < 0:
             self.cue_output.addItem(f"Indisponível · manter seleção salva ({stored_cue_id})", stored_cue_id)
             cue_selected = self.cue_output.count() - 1
@@ -48,7 +51,7 @@ class AppSettingsDialog(QDialog):
         self.startup_play.setChecked(db.setting("startup_play", "0") == "1")
         self.station_name = QLineEdit(db.setting("station_name", "HitMo Radio"))
         form.addRow("Saída de áudio", self.output)
-        form.addRow("Saída CUE independente", self.cue_output)
+        form.addRow("Saída CUE", self.cue_output)
         form.addRow("Nome da emissora", self.station_name)
         form.addRow("", self.auto_advance)
         form.addRow("", self.startup_play)
@@ -64,11 +67,6 @@ class AppSettingsDialog(QDialog):
         old_output_id = self.db.setting("audio_output_id")
         old_cue_id = self.db.setting("cue_output_id")
         if (output_id, cue_id) != (old_output_id, old_cue_id):
-            selected_output = AudioEngine._device_id_for_selection(output_id)
-            selected_cue = AudioEngine._device_id_for_selection(cue_id) if cue_id else ""
-            if selected_cue and selected_cue == selected_output:
-                QMessageBox.warning(self, "Saídas incompatíveis", "PGM e CUE precisam usar dispositivos de saída distintos.")
-                return
             try:
                 self.engine.configure_outputs(output_id, cue_id)
             except ValueError as exc:

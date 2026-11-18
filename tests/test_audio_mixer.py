@@ -2,7 +2,10 @@ import unittest
 
 import numpy as np
 
-from hitmo.audio_mixer import DEFAULT_MASTER_GAIN, LIMITER_CEILING, equal_power_crossfade, mix_pcm
+from hitmo.audio_mixer import (
+    DEFAULT_MASTER_GAIN, LIMITER_CEILING, equal_power_crossfade, mix_pcm,
+    mix_shared_buses,
+)
 
 
 class AudioMixerMathTests(unittest.TestCase):
@@ -37,6 +40,42 @@ class AudioMixerMathTests(unittest.TestCase):
         self.assertLessEqual(float(np.max(np.abs(out))), LIMITER_CEILING)
         self.assertAlmostEqual(meter.peak, LIMITER_CEILING)
         self.assertLess(meter.limiter_gain, 1.0)
+
+    def test_shared_buses_mix_with_independent_gain_mute_and_meters(self):
+        pgm = np.full((64, 2), 0.4, np.float32)
+        cue = np.full((64, 2), 0.2, np.float32)
+        kwargs = dict(
+            bus_sources={"PGM": {"program": pgm}, "CUE": {"preview": cue}},
+            bus_gains={"PGM": {"program": 1.0}, "CUE": {"preview": 1.0}},
+            bus_muted_channels={"PGM": set(), "CUE": set()},
+            bus_gain={"PGM": 0.5, "CUE": 0.25},
+            bus_muted={"PGM": False, "CUE": False}, master_gain=1.0,
+        )
+        out, meters = mix_shared_buses(**kwargs)
+        self.assertTrue(np.allclose(out, 0.25))
+        self.assertAlmostEqual(meters["PGM"].peak, 0.2)
+        self.assertAlmostEqual(meters["CUE"].peak, 0.05)
+        kwargs["bus_gain"]["CUE"] = 0.5
+        cue_louder, _ = mix_shared_buses(**kwargs)
+        self.assertTrue(np.allclose(cue_louder - out, 0.05))
+        kwargs["bus_muted"]["CUE"] = True
+        muted, cue_meter = mix_shared_buses(**kwargs)
+        self.assertTrue(np.allclose(muted, 0.2))
+        self.assertEqual(cue_meter["CUE"].rms, 0.0)
+
+    def test_shared_mix_limiter_is_linked_and_stable(self):
+        signal = np.full((4096, 2), 0.9, np.float32)
+        out, meters = mix_shared_buses(
+            {"PGM": {"p": signal}, "CUE": {"c": signal}},
+            {"PGM": {"p": 1.0}, "CUE": {"c": 1.0}},
+            {"PGM": set(), "CUE": set()},
+            bus_gain={"PGM": 1.0, "CUE": 1.0},
+            bus_muted={"PGM": False, "CUE": False}, master_gain=1.0,
+        )
+        self.assertTrue(np.isfinite(out).all())
+        self.assertLessEqual(float(np.max(np.abs(out))), LIMITER_CEILING)
+        self.assertAlmostEqual(meters["PGM"].limiter_gain, meters["CUE"].limiter_gain)
+        self.assertLess(meters["PGM"].limiter_gain, 1.0)
 
 
 if __name__ == "__main__":

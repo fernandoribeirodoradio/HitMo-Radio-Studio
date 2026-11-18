@@ -368,9 +368,17 @@ class MainWindow(QMainWindow):
         lib_buttons.addWidget(add_selected)
         lib_buttons.addWidget(import_folder)
         ll.addLayout(lib_buttons)
+        preview_controls = QHBoxLayout()
+        pause_preview = QPushButton("Pausar pré-escuta")
+        pause_preview.clicked.connect(self.engine.pause_preview)
+        resume_preview = QPushButton("Retomar pré-escuta")
+        resume_preview.clicked.connect(self.engine.resume_preview)
         stop_preview = QPushButton("Parar pré-escuta")
         stop_preview.clicked.connect(self.engine.stop_preview)
-        ll.addWidget(stop_preview)
+        preview_controls.addWidget(pause_preview)
+        preview_controls.addWidget(resume_preview)
+        preview_controls.addWidget(stop_preview)
+        ll.addLayout(preview_controls)
         self.library_dock = QDockWidget("Biblioteca de mídia", self)
         self.library_dock.setObjectName("libraryDock")
         self.library_dock.setWidget(lib)
@@ -669,7 +677,7 @@ class MainWindow(QMainWindow):
     def _route_combo(self, current: str) -> QComboBox:
         combo = QComboBox()
         combo.addItem("PGM", "PGM")
-        cue_label = "CUE" if self.engine.cue_available else "CUE · sem saída"
+        cue_label = "CUE · compartilhado" if self.engine._shared_output else ("CUE" if self.engine.cue_available else "CUE · sem saída")
         combo.addItem(cue_label, "CUE")
         if not self.engine.cue_available:
             combo.model().item(1).setEnabled(False)
@@ -707,7 +715,7 @@ class MainWindow(QMainWindow):
         self.preview_channel_mute.setChecked(self.engine.channel_muted("preview"))
         self.preview_channel_mute.blockSignals(False)
         pgm_name = self._output_name(self.engine.pgm_device_id) or "sem saída"
-        cue_name = self._output_name(self.engine.cue_device_id) if self.engine.cue_available else "desativado · requer outra saída física"
+        cue_name = (self._output_name(self.engine.cue_device_id) + " (compartilhada)") if self.engine.cue_available and self.engine._shared_output else (self._output_name(self.engine.cue_device_id) if self.engine.cue_available else "desativado")
         self.output_summary.setText(f"PGM → {pgm_name}    |    CUE → {cue_name}")
         self.program_audio_state.setText(f"PGM · {self._player_state_text(self.engine.program.playbackState())}")
         self.cue_audio_state.setText(f"CUE · {self._player_state_text(self.engine.preview.playbackState())}")
@@ -983,7 +991,7 @@ class MainWindow(QMainWindow):
         if self.engine.cue_configuration_error:
             self.statusBar().showMessage(f"CUE indisponível: {self.engine.cue_configuration_error}", 10000)
         elif not self.engine.cue_available:
-            self.statusBar().showMessage("CUE desativado · configure uma saída diferente em Preferências", 8000)
+            self.statusBar().showMessage("CUE desativado · configure uma saída de áudio em Preferências", 8000)
 
     def _operator_changed(self, name: str):
         if hasattr(self, "operator_label"):

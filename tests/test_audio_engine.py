@@ -243,8 +243,10 @@ class AudioEngineSmokeTests(unittest.TestCase):
             self.assertTrue(engine.play_cartouche(1, str(path)))
             self.assertTrue(self._wait_until(lambda: engine.program.position() > cart_start))
             self.assertEqual(engine.program.playbackState(), QMediaPlayer.PlaybackState.PlayingState)
-            with self.assertRaises(ValueError):
-                engine.set_cue_output(engine.pgm_device_id)
+            pgm_sink = engine._buses["PGM"].sink
+            engine.configure_outputs(engine.pgm_device_id, engine.pgm_device_id)
+            self.assertTrue(engine._shared_output)
+            self.assertIs(engine._buses["PGM"].sink, pgm_sink)
             engine.shutdown()
             engine.deleteLater()
             self.app.processEvents()

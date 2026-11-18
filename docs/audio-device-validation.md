@@ -2,7 +2,7 @@
 
 ## Comportamento coberto por software
 
-PGM e CUE mantêm sinks e destinos independentes. Se um dispositivo selecionado desaparecer, o HitMo marca somente o barramento correspondente como indisponível e pausa as fontes que estavam tocando nele. Ao detectar novamente o mesmo dispositivo, recria o sink e retoma apenas essas fontes. Uma seleção PGM explicitamente salva que não esteja disponível não é substituída silenciosamente pelo dispositivo padrão. O CUE pode permanecer desativado quando não há um segundo endpoint.
+Com duas saídas selecionadas, PGM e CUE mantêm sinks e destinos independentes. Quando ambos usam a mesma saída, o motor abre somente um sink PGM e soma nele as contribuições independentes dos barramentos lógicos. Em uma máquina com apenas uma saída enumerada, o CUE compartilha essa saída automaticamente. Se o endpoint compartilhado desaparecer, os dois barramentos ficam indisponíveis e suas fontes são pausadas; a reconexão recria o sink e retoma as fontes pausadas. Uma seleção PGM explicitamente salva que não esteja disponível não é substituída silenciosamente pelo dispositivo padrão. O modo compartilhado não oferece isolamento físico entre PGM e CUE.
 
 O callback de cada `QAudioSink` continua alimentando o mixer em PCM; os medidores seguem medindo as amostras entregues a cada sink depois do ganho e limitador. A validação automatizada de sinks e dispositivos usa objetos simulados e não demonstra saída audível, roteamento da placa, sinal de mesa ou transmissão. Os testes de WAV existentes exercitam a decodificação e buffers Qt no ambiente de execução disponível; isso também não substitui escuta e validação de hardware na emissora.
 

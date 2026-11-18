@@ -130,3 +130,63 @@ def mix_pcm(
     peak = float(np.max(np.abs(mixed))) if mixed.size else 0.0
     rms = float(np.sqrt(np.mean(np.square(mixed, dtype=np.float64)))) if mixed.size else 0.0
     return mixed, MixMeter(peak, rms, limiter_gain)
+
+
+def mix_shared_buses(
+    bus_sources: dict[str, dict[str, np.ndarray]],
+    bus_gains: dict[str, dict[str, float | np.ndarray]],
+    bus_muted_channels: dict[str, set[str] | frozenset[str]],
+    *,
+    bus_gain: dict[str, float],
+    bus_muted: dict[str, bool],
+    master_gain: float = DEFAULT_MASTER_GAIN,
+    ceiling: float = LIMITER_CEILING,
+) -> tuple[np.ndarray, dict[str, MixMeter]]:
+    """Mix logical PGM/CUE buses to one PCM output with one linked limiter.
+
+    The returned meters describe each bus contribution after the shared
+    limiter, so their sum corresponds to the output samples (before clipping
+    guard rounding).
+    """
+    frame_count = max(
+        (len(source) for sources in bus_sources.values() for source in sources.values()),
+        default=0,
+    )
+    contributions: dict[str, np.ndarray] = {}
+    for bus in ("PGM", "CUE"):
+        contribution = np.zeros((frame_count, CHANNELS), dtype=np.float32)
+        for source_id, source in bus_sources.get(bus, {}).items():
+            if source_id in bus_muted_channels.get(bus, frozenset()):
+                continue
+            data = np.asarray(source, dtype=np.float32)
+            if data.ndim != 2 or data.shape[1] != CHANNELS:
+                raise ValueError(f"A fonte {source_id} precisa ter amostras estéreo float.")
+            count = min(frame_count, len(data))
+            gain = bus_gains.get(bus, {}).get(source_id, 1.0)
+            if np.isscalar(gain):
+                contribution[:count] += data[:count] * float(gain)
+            else:
+                envelope = np.asarray(gain, dtype=np.float32).reshape(-1)
+                if len(envelope) < count:
+                    fill = envelope[-1] if len(envelope) else 1.0
+                    envelope = np.pad(envelope, (0, count - len(envelope)), constant_values=fill)
+                contribution[:count] += data[:count] * envelope[:count, None]
+        if bus_muted.get(bus, False):
+            contribution.fill(0)
+        contribution *= float(bus_gain.get(bus, 1.0)) * float(master_gain)
+        contributions[bus] = contribution
+
+    mixed = contributions["PGM"] + contributions["CUE"]
+    pre_limit_peak = float(np.max(np.abs(mixed))) if mixed.size else 0.0
+    limiter_gain = min(1.0, float(ceiling) / pre_limit_peak) if pre_limit_peak > 0 else 1.0
+    if limiter_gain < 1.0:
+        mixed *= limiter_gain
+        safe_ceiling = float(np.nextafter(np.float32(ceiling), np.float32(0.0)))
+        np.clip(mixed, -safe_ceiling, safe_ceiling, out=mixed)
+    meters: dict[str, MixMeter] = {}
+    for bus, contribution in contributions.items():
+        contribution *= limiter_gain
+        peak = float(np.max(np.abs(contribution))) if contribution.size else 0.0
+        rms = float(np.sqrt(np.mean(np.square(contribution, dtype=np.float64)))) if contribution.size else 0.0
+        meters[bus] = MixMeter(peak, rms, limiter_gain)
+    return mixed, meters

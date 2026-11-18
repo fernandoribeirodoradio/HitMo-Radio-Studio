@@ -1,9 +1,11 @@
 import os
 import unittest
 
+import numpy as np
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QUrl, Signal
 from PySide6.QtMultimedia import QAudio, QAudioFormat, QMediaPlayer
 from PySide6.QtWidgets import QApplication
 
@@ -76,6 +78,15 @@ class FakePlayer:
         self.plays += 1
         self.state = QMediaPlayer.PlaybackState.PlayingState
 
+    def stop(self):
+        self.state = QMediaPlayer.PlaybackState.StoppedState
+
+    def source(self):
+        return QUrl("file:///fake.wav")
+
+    def setSource(self, _source):
+        pass
+
 
 class AudioDeviceRecoveryTests(unittest.TestCase):
     @classmethod
@@ -104,9 +115,106 @@ class AudioDeviceRecoveryTests(unittest.TestCase):
         engine, _ = self.make_engine(["pgm"])
         try:
             self.assertEqual(engine.pgm_device_id, "pgm")
-            self.assertFalse(engine.cue_available)
-            self.assertIn("não está disponível", engine.cue_configuration_error)
+            self.assertTrue(engine.cue_available)
+            self.assertTrue(engine._shared_output)
+            self.assertEqual(engine.cue_device_id, "pgm")
+            self.assertIsNone(engine._buses["CUE"].sink)
+            engine.configure_outputs("pgm", "removed-cue")
+            self.assertTrue(engine.cue_available)
+            self.assertTrue(engine._shared_output)
         finally:
+            self.close_engine(engine)
+
+    def test_shared_output_reads_both_logical_buses_into_one_sink(self):
+        engine, _ = self.make_engine(["pgm"])
+        try:
+            engine._master_gain = 1.0
+            engine.set_bus_gain("PGM", 0.5)
+            engine.set_bus_gain("CUE", 0.25)
+            engine._channels["program"]["queue"].push(np.full((4, 2), 0.4, np.float32))
+            engine._channels["preview"]["queue"].push(np.full((4, 2), 0.2, np.float32))
+            pgm_sink = engine._buses["PGM"].sink
+            encoded = pgm_sink.source.readData(4 * 2 * 4)
+            output = np.frombuffer(encoded, dtype=np.float32).reshape(-1, 2)
+            self.assertTrue(np.allclose(output, 0.25))
+            self.assertIsNone(engine._buses["CUE"].sink)
+        finally:
+            self.close_engine(engine)
+
+    def test_shared_pgm_and_cue_render_alone_and_cue_continues_after_pgm_queue_ends(self):
+        engine, _ = self.make_engine(["pgm"])
+        try:
+            engine._master_gain = 1.0
+            sink_source = engine._buses["PGM"].source
+            engine._channels["program"]["queue"].push(np.full((4, 2), 0.2, np.float32))
+            pgm_only = np.frombuffer(sink_source.readData(32), dtype=np.float32).reshape(-1, 2)
+            self.assertTrue(np.allclose(pgm_only, 0.2))
+            engine._channels["preview"]["queue"].push(np.full((4, 2), 0.3, np.float32))
+            cue_only_after_pgm_end = np.frombuffer(sink_source.readData(32), dtype=np.float32).reshape(-1, 2)
+            self.assertTrue(np.allclose(cue_only_after_pgm_end, 0.3))
+        finally:
+            self.close_engine(engine)
+
+    def test_activate_shared_cue_while_pgm_runs_does_not_rebuild_pgm_sink(self):
+        engine, _ = self.make_engine(["pgm", "cue"])
+        player = FakePlayer(QMediaPlayer.PlaybackState.PlayingState)
+        engine._channels["program"]["player"] = player
+        try:
+            pgm_sink = engine._buses["PGM"].sink
+            engine.configure_outputs("pgm", "pgm")
+            self.assertIs(engine._buses["PGM"].sink, pgm_sink)
+            self.assertTrue(pgm_sink.started)
+            self.assertEqual(player.state, QMediaPlayer.PlaybackState.PlayingState)
+            self.assertTrue(engine._shared_output)
+            self.assertIsNone(engine._buses["CUE"].sink)
+        finally:
+            self.close_engine(engine)
+
+    def test_preview_pause_resume_and_stop_do_not_change_pgm(self):
+        engine, _ = self.make_engine(["pgm"])
+        original_preview = engine.preview
+        original_channel_player = engine._channels["preview"]["player"]
+        cue_player = FakePlayer(QMediaPlayer.PlaybackState.PlayingState)
+        pgm_player = FakePlayer(QMediaPlayer.PlaybackState.PlayingState)
+        engine.preview = cue_player
+        engine._channels["preview"]["player"] = cue_player
+        engine._channels["program"]["player"] = pgm_player
+        try:
+            engine.pause_preview()
+            self.assertEqual(cue_player.state, QMediaPlayer.PlaybackState.PausedState)
+            self.assertEqual(pgm_player.state, QMediaPlayer.PlaybackState.PlayingState)
+            engine.resume_preview()
+            self.assertEqual(cue_player.state, QMediaPlayer.PlaybackState.PlayingState)
+            engine.stop_preview()
+            self.assertEqual(cue_player.state, QMediaPlayer.PlaybackState.StoppedState)
+            self.assertEqual(pgm_player.state, QMediaPlayer.PlaybackState.PlayingState)
+        finally:
+            engine.preview = original_preview
+            engine._channels["preview"]["player"] = original_channel_player
+            self.close_engine(engine)
+
+    def test_stopping_pgm_keeps_shared_cue_player_running(self):
+        engine, _ = self.make_engine(["pgm"])
+        original_program = engine.program
+        original_preview = engine.preview
+        original_program_channel = engine._channels["program"]["player"]
+        original_preview_channel = engine._channels["preview"]["player"]
+        pgm_player = FakePlayer(QMediaPlayer.PlaybackState.PlayingState)
+        cue_player = FakePlayer(QMediaPlayer.PlaybackState.PlayingState)
+        engine.program = pgm_player
+        engine.preview = cue_player
+        engine._channels["program"]["player"] = pgm_player
+        engine._channels["preview"]["player"] = cue_player
+        try:
+            engine.stop_program()
+            self.assertEqual(pgm_player.state, QMediaPlayer.PlaybackState.StoppedState)
+            self.assertEqual(cue_player.state, QMediaPlayer.PlaybackState.PlayingState)
+            self.assertTrue(engine.cue_available)
+        finally:
+            engine.program = original_program
+            engine.preview = original_preview
+            engine._channels["program"]["player"] = original_program_channel
+            engine._channels["preview"]["player"] = original_preview_channel
             self.close_engine(engine)
 
     def test_missing_explicit_pgm_does_not_fall_back_to_another_device(self):
@@ -168,13 +276,15 @@ class AudioDeviceRecoveryTests(unittest.TestCase):
         finally:
             self.close_engine(engine)
 
-    def test_distinct_buses_are_required(self):
+    def test_same_device_uses_one_shared_sink(self):
         engine, _ = self.make_engine(["pgm", "cue"])
         try:
-            with self.assertRaises(ValueError):
-                engine.configure_outputs("pgm", "pgm")
+            engine.configure_outputs("pgm", "pgm")
             self.assertEqual(engine.pgm_device_id, "pgm")
-            self.assertEqual(engine.cue_device_id, "cue")
+            self.assertEqual(engine.cue_device_id, "pgm")
+            self.assertTrue(engine.cue_available)
+            self.assertTrue(engine._shared_output)
+            self.assertIsNone(engine._buses["CUE"].sink)
         finally:
             self.close_engine(engine)
 
