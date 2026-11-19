@@ -1032,10 +1032,14 @@ class MainWindow(QMainWindow):
         try:
             state = self.db.setting("window_state")
             geometry = self.db.setting("window_geometry")
+            layout_version = self.db.setting("dock_layout_version", "")
             if geometry:
                 self.restoreGeometry(bytes.fromhex(geometry))
-            if state:
+            # Apply the redesigned dock arrangement once without deleting the
+            # previous saved state; subsequent launches restore the new layout.
+            if state and layout_version == "2":
                 self.restoreState(bytes.fromhex(state))
+            self.db.set_setting("dock_layout_version", "2")
         except (ValueError, TypeError):
             pass
 
