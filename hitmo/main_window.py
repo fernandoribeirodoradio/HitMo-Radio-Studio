@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QDateEdit, QDockWidget, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QInputDialog,
     QGroupBox, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox, QStyle, QTableWidget, QTableWidgetItem,
-    QTimeEdit, QVBoxLayout, QScrollArea, QWidget,
+    QTimeEdit, QVBoxLayout, QScrollArea, QTabWidget, QWidget,
 )
 
 from .audio_engine import AudioEngine
@@ -391,10 +391,28 @@ class MainWindow(QMainWindow):
         self.timeline_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.timeline_table.horizontalHeader().setStretchLastSection(True)
         self.timeline_table.itemChanged.connect(self._timeline_toggled)
+
+        # Visual 24-hour schedule: 12 five-minute cells per hour. Cells are
+        # populated only from persisted timeline events; empty cells stay empty.
+        self.timeline_grid = QTableWidget(24, 12)
+        self.timeline_grid.setObjectName("timelineGrid")
+        self.timeline_grid.setHorizontalHeaderLabels([f"{minute:02d}" for minute in range(0, 60, 5)])
+        self.timeline_grid.setVerticalHeaderLabels([f"{hour:02d}:00" for hour in range(24)])
+        self.timeline_grid.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.timeline_grid.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        self.timeline_grid.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.timeline_grid.horizontalHeader().setDefaultSectionSize(78)
+        self.timeline_grid.verticalHeader().setDefaultSectionSize(38)
+        self.timeline_grid.horizontalHeader().setStretchLastSection(True)
+        self.timeline_grid.verticalHeader().setMinimumWidth(58)
+        self.timeline_grid.cellDoubleClicked.connect(self._timeline_grid_activated)
+        timeline_tabs = QTabWidget()
+        timeline_tabs.addTab(self.timeline_grid, "GRADE 24 HORAS")
+        timeline_tabs.addTab(self.timeline_table, "LISTA DE EVENTOS")
         timeline_panel = QWidget()
         tl = QVBoxLayout(timeline_panel)
         tl.setContentsMargins(8, 8, 8, 8)
-        tl.addWidget(self.timeline_table)
+        tl.addWidget(timeline_tabs, 1)
         tl_buttons = QHBoxLayout()
         add_event = QPushButton("Novo evento")
         add_event.clicked.connect(self._add_timeline_event)
@@ -1982,6 +2000,67 @@ class MainWindow(QMainWindow):
                 self.timeline_table.setItem(index, col, cell)
         self.timeline_table.resizeColumnsToContents()
         self.timeline_table.blockSignals(False)
+        self._refresh_timeline_grid()
+
+    def _refresh_timeline_grid(self):
+        if not hasattr(self, "timeline_grid"):
+            return
+        self.timeline_grid.clearContents()
+        events = self.timeline.events()
+        buckets = {}
+        for event in events:
+            try:
+                hour_text, minute_text = str(event["time_of_day"]).split(":", 1)
+                hour, minute = int(hour_text), int(minute_text)
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= hour < 24 and 0 <= minute < 60):
+                continue
+            column = minute // 5
+            buckets.setdefault((hour, column), []).append(event)
+        for hour in range(24):
+            for column in range(12):
+                entries = buckets.get((hour, column), [])
+                if entries:
+                    labels = []
+                    for event in entries:
+                        status = "●" if event["enabled"] else "Ⅱ"
+                        labels.append(f"{status} {event['time_of_day']}  {event['title']}")
+                    item = QTableWidgetItem("\\n".join(labels))
+                    item.setData(ROLE, int(entries[0]["id"]))
+                    details = []
+                    for event in entries:
+                        details.append(
+                            f"{event['time_of_day']} · {event['title']} · {event['category']} · "
+                            f"{'Ativo' if event['enabled'] else 'Pausado'} · Dias: {event['days']} · "
+                            f"Áudio: {event['media_title'] or 'não associado'}"
+                        )
+                    item.setToolTip("\\n".join(details))
+                    category = str(entries[0]["category"]).casefold()
+                    if "comercial" in category:
+                        item.setBackground(QColor("#245b43"))
+                    elif "música" in category or "musica" in category:
+                        item.setBackground(QColor("#244d83"))
+                    else:
+                        item.setBackground(QColor("#67416f"))
+                    item.setForeground(QColor("#ffffff"))
+                else:
+                    item = QTableWidgetItem("")
+                    item.setToolTip(f"{hour:02d}:{column * 5:02d} · Sem evento cadastrado")
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.timeline_grid.setItem(hour, column, item)
+
+    def _timeline_grid_activated(self, hour: int, column: int):
+        item = self.timeline_grid.item(hour, column)
+        if not item or item.data(ROLE) is None:
+            return
+        event_id = int(item.data(ROLE))
+        for row in range(self.timeline_table.rowCount()):
+            cell = self.timeline_table.item(row, 0)
+            if cell and int(cell.data(ROLE) or -1) == event_id:
+                self.timeline_table.selectRow(row)
+                self.timeline_table.scrollToItem(cell)
+                return
 
     def _timeline_toggled(self, item):
         if item.column() != 0:
