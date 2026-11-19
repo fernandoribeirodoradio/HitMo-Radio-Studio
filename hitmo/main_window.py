@@ -940,29 +940,84 @@ class MainWindow(QMainWindow):
         if system_font.is_file():
             QFontDatabase.addApplicationFont(str(system_font))
         self.setStyleSheet("""
-            QMainWindow, QWidget { background:#111317; color:#e7e9ee; font-family:'Segoe UI'; font-size:10pt; }
-            QMenuBar, QToolBar, QStatusBar { background:#171a20; border:0; }
-            QToolBar { spacing:8px; padding:8px 12px; }
+            /* HitMo Master Console — metallic silver and cobalt blue */
+            QMainWindow, QWidget {
+                background:#c8cdd3; color:#172536;
+                font-family:'Segoe UI'; font-size:9pt;
+            }
+            QMenuBar, QToolBar, QStatusBar {
+                background:#e5e8ec; color:#172536; border:0;
+            }
+            QToolBar {
+                spacing:8px; padding:7px 12px;
+                border-bottom:1px solid #9da8b4;
+            }
             QDockWidget { font-weight:600; }
-            QDockWidget::title { background:#1c2028; padding:9px; border-bottom:1px solid #2a2f39; }
-            QLineEdit, QComboBox, QTimeEdit { background:#191d24; border:1px solid #303642; border-radius:6px; padding:8px; selection-background-color:#6d5dfc; }
-            QListWidget, QTableWidget { background:#15181e; alternate-background-color:#191d24; border:1px solid #292e38; border-radius:8px; gridline-color:#242a33; }
-            QListWidget::item, QTableWidget::item { padding:7px; border-bottom:1px solid #222731; }
-            QListWidget::item:selected, QTableWidget::item:selected { background:#302c53; color:white; }
-            QHeaderView::section { background:#1b1f27; color:#9da5b3; padding:8px; border:0; border-bottom:1px solid #303642; }
-            QPushButton { background:#242933; border:1px solid #353c49; border-radius:7px; padding:8px 12px; }
-            QPushButton:hover { background:#303746; }
-            QPushButton:checked { background:#4d45b6; border-color:#6d5dfc; }
-            QPushButton#primaryButton { background:#6d5dfc; color:white; border:0; font-weight:700; }
-            QPushButton#primaryButton:hover { background:#7e70ff; }
-            QLabel#stationName { color:#8993a4; font-size:10pt; font-weight:600; }
-            QLabel#nowTitle { font-size:25pt; font-weight:700; color:#fff; }
-            QLabel#mutedText { color:#8993a4; }
-            QLabel#clockLabel { color:#81d9af; font-size:14pt; font-weight:700; padding:0 12px; }
-            QLabel#autoBadge { background:#203d31; color:#85e1b4; border-radius:10px; padding:6px 10px; font-weight:700; }
-            QProgressBar { background:#20242c; border:0; border-radius:2px; }
-            QProgressBar::chunk { background:#6d5dfc; border-radius:2px; }
-            QScrollBar:vertical { background:#15181e; width:10px; } QScrollBar::handle:vertical { background:#343b48; border-radius:5px; min-height:25px; }
+            QDockWidget::title {
+                background:#174b7d; color:#fff; padding:9px 11px;
+                border:1px solid #0d355b;
+            }
+            QLineEdit, QComboBox, QTimeEdit, QDateEdit, QSpinBox {
+                background:#f8fafc; color:#172536;
+                border:1px solid #9aa8b6; border-radius:4px;
+                padding:7px; selection-background-color:#1769aa;
+            }
+            QListWidget, QTableWidget {
+                background:#f7f9fb; color:#172536;
+                alternate-background-color:#e9eef3;
+                border:1px solid #9aa8b6; border-radius:4px;
+                gridline-color:#d0d8e0;
+            }
+            QListWidget::item, QTableWidget::item {
+                padding:6px; border-bottom:1px solid #dce2e8;
+            }
+            QListWidget::item:selected, QTableWidget::item:selected {
+                background:#c7def2; color:#102b45;
+            }
+            QHeaderView::section {
+                background:#d9e0e7; color:#193a59; padding:8px;
+                border:0; border-bottom:2px solid #27679d;
+                font-weight:700;
+            }
+            QPushButton {
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                    stop:0 #f9fbfd, stop:1 #cbd3db);
+                color:#18334d; border:1px solid #8796a5;
+                border-radius:4px; padding:8px 12px; font-weight:600;
+            }
+            QPushButton:hover { background:#e5f1fb; border-color:#276da6; }
+            QPushButton:pressed { background:#b9cbdc; }
+            QPushButton:checked {
+                background:#174f82; color:#fff; border-color:#0e3c66;
+            }
+            QPushButton#primaryButton {
+                background:qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                    stop:0 #287dbb, stop:1 #124a79);
+                color:#fff; border:1px solid #0c3b63; font-weight:800;
+            }
+            QPushButton#primaryButton:hover { background:#328bc9; }
+            QLabel#stationName { color:#35536e; font-size:10pt; font-weight:700; }
+            QLabel#nowTitle { font-size:22pt; font-weight:800; color:#123c62; }
+            QLabel#mutedText { color:#536b80; }
+            QLabel#clockLabel {
+                color:#0c4a78; font-size:14pt; font-weight:800; padding:0 12px;
+            }
+            QLabel#autoBadge {
+                background:#d7eadf; color:#17623b; border:1px solid #8dbda0;
+                border-radius:4px; padding:6px 10px; font-weight:800;
+            }
+            QProgressBar { background:#aebbc7; border:1px solid #8293a3; border-radius:2px; }
+            QProgressBar::chunk { background:#ed8b24; border-radius:1px; }
+            QScrollBar:vertical { background:#dce2e8; width:11px; }
+            QScrollBar::handle:vertical {
+                background:#8da3b7; border-radius:4px; min-height:25px;
+            }
+            QGroupBox {
+                border:1px solid #9aa9b7; border-radius:4px;
+                margin-top:10px; padding-top:8px; font-weight:700;
+                color:#19466d;
+            }
+            QGroupBox::title { subcontrol-origin:margin; left:10px; padding:0 4px; }
         """)
 
     def _restore_window(self):
