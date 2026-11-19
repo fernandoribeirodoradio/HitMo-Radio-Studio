@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QDateEdit, QDockWidget, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QInputDialog,
     QGroupBox, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox, QStyle, QTableWidget, QTableWidgetItem,
-    QTimeEdit, QVBoxLayout, QWidget,
+    QTimeEdit, QVBoxLayout, QScrollArea, QWidget,
 )
 
 from .audio_engine import AudioEngine
@@ -382,7 +382,8 @@ class MainWindow(QMainWindow):
         self.library_dock = QDockWidget("Biblioteca de mídia", self)
         self.library_dock.setObjectName("libraryDock")
         self.library_dock.setWidget(lib)
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.library_dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.library_dock)
+        self.library_dock.setMinimumWidth(320)
 
         self.timeline_table = QTableWidget(0, 5)
         self.timeline_table.setHorizontalHeaderLabels(["Ativo", "Hora", "Evento", "Tipo", "Áudio"])
@@ -406,7 +407,8 @@ class MainWindow(QMainWindow):
         self.timeline_dock = QDockWidget("Timeline musical e comercial", self)
         self.timeline_dock.setObjectName("timelineDock")
         self.timeline_dock.setWidget(timeline_panel)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.timeline_dock)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.timeline_dock)
+        self.timeline_dock.setMinimumWidth(360)
 
         self.program_table = QTableWidget(0, 6)
         self.program_table.setHorizontalHeaderLabels(["Ativo", "Hora", "Bloco", "Tipo", "Dias", "Itens"])
@@ -424,6 +426,7 @@ class MainWindow(QMainWindow):
         self.program_dock.setObjectName("programDock")
         self.program_dock.setWidget(program_panel)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.program_dock)
+        self.program_dock.setMinimumHeight(190)
 
         history_filters = QHBoxLayout()
         self.history_period_enabled = QCheckBox("Período")
@@ -538,10 +541,9 @@ class MainWindow(QMainWindow):
         self.cart_dock.setWidget(cart_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.cart_dock)
         self._build_audio_console()
-        self.tabifyDockWidget(self.timeline_dock, self.history_dock)
-        self.tabifyDockWidget(self.history_dock, self.cart_dock)
-        self.tabifyDockWidget(self.program_dock, self.timeline_dock)
-        self.tabifyDockWidget(self.cart_dock, self.console_dock)
+        self.tabifyDockWidget(self.library_dock, self.history_dock)
+        self.tabifyDockWidget(self.library_dock, self.cart_dock)
+        self.library_dock.raise_()
         self.console_dock.raise_()
 
         self._build_menus()
@@ -666,8 +668,14 @@ class MainWindow(QMainWindow):
 
         self.console_dock = QDockWidget("Console de áudio · PGM / CUE", self)
         self.console_dock.setObjectName("audioConsoleDock")
-        self.console_dock.setWidget(panel)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.console_dock)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(panel)
+        self.console_dock.setWidget(scroll)
+        self.addDockWidget(Qt.DockWidgetArea.TopDockWidgetArea, self.console_dock)
+        self.console_dock.setMinimumHeight(190)
+        self.console_dock.setMaximumHeight(310)
         self._refresh_audio_console()
 
     def _master_gain_changed(self, value: int):
