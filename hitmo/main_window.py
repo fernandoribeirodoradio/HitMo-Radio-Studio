@@ -2026,7 +2026,7 @@ class MainWindow(QMainWindow):
                     for event in entries:
                         status = "●" if event["enabled"] else "Ⅱ"
                         labels.append(f"{status} {event['time_of_day']}  {event['title']}")
-                    item = QTableWidgetItem("\\n".join(labels))
+                    item = QTableWidgetItem("\n".join(labels))
                     item.setData(ROLE, int(entries[0]["id"]))
                     details = []
                     for event in entries:
@@ -2035,7 +2035,7 @@ class MainWindow(QMainWindow):
                             f"{'Ativo' if event['enabled'] else 'Pausado'} · Dias: {event['days']} · "
                             f"Áudio: {event['media_title'] or 'não associado'}"
                         )
-                    item.setToolTip("\\n".join(details))
+                    item.setToolTip("\n".join(details))
                     category = str(entries[0]["category"]).casefold()
                     if "comercial" in category:
                         item.setBackground(QColor("#245b43"))
